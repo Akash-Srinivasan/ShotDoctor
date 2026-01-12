@@ -1,0 +1,328 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { View, Text, TouchableOpacity, StyleSheet, Alert } from 'react-native';
+import { CameraView, CameraType, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
+import * as MediaLibrary from 'expo-media-library';
+
+interface RecordingCameraProps {
+  onVideoRecorded: (uri: string) => void;
+  onCancel?: () => void;
+}
+
+export function RecordingCamera({ onVideoRecorded, onCancel }: RecordingCameraProps) {
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [microphonePermission, requestMicrophonePermission] = useMicrophonePermissions();
+  const [mediaPermission, requestMediaPermission] = MediaLibrary.usePermissions();
+  
+  const [isRecording, setIsRecording] = useState(false);
+  const [facing, setFacing] = useState<CameraType>('back');
+  const cameraRef = useRef<CameraView>(null);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    // Request all permissions on mount
+    (async () => {
+      if (!cameraPermission?.granted) {
+        await requestCameraPermission();
+      }
+      if (!microphonePermission?.granted) {
+        await requestMicrophonePermission();
+      }
+      if (!mediaPermission?.granted) {
+        await requestMediaPermission();
+      }
+    })();
+
+    // Cleanup timer on unmount
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+      }
+    };
+  }, []);
+
+  const startRecording = async () => {
+    if (!cameraRef.current) return;
+
+    try {
+      setIsRecording(true);
+      setRecordingTime(0);
+
+      // Start timer
+      timerRef.current = setInterval(() => {
+        setRecordingTime(prev => prev + 1);
+      }, 1000);
+
+      console.log('🎥 Starting recording...');
+      
+      const video = await cameraRef.current.recordAsync({
+        maxDuration: 300, // 5 minutes max
+      });
+
+      if (!video) {
+        throw new Error('Recording failed - no video returned');
+      }
+
+      console.log('✓ Recording saved:', video.uri);
+      
+      // Save to media library
+      try {
+        await MediaLibrary.saveToLibraryAsync(video.uri);
+        console.log('✓ Video saved to library');
+      } catch (saveError) {
+        console.warn('Warning: Could not save to library:', saveError);
+        // Continue anyway - we still have the video
+      }
+      
+      onVideoRecorded(video.uri);
+    } catch (error) {
+      console.error('❌ Recording error:', error);
+      Alert.alert('Recording Error', 'Failed to record video. Please try again.');
+    } finally {
+      setIsRecording(false);
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      setRecordingTime(0);
+    }
+  };
+
+  const stopRecording = async () => {
+    if (!cameraRef.current || !isRecording) return;
+
+    console.log('🛑 Stopping recording...');
+    
+    try {
+      await cameraRef.current.stopRecording();
+    } catch (error) {
+      console.error('Stop recording error:', error);
+    }
+  };
+
+  const toggleCameraFacing = () => {
+    setFacing(current => (current === 'back' ? 'front' : 'back'));
+  };
+
+  const formatTime = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // Check permissions
+  if (!cameraPermission || !microphonePermission) {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.text}>Requesting permissions...</Text>
+      </View>
+    );
+  }
+
+  if (!cameraPermission.granted || !microphonePermission.granted) {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.text}>Camera and microphone access required</Text>
+        <Text style={styles.subtext}>
+          Please enable camera and microphone permissions in Settings
+        </Text>
+        <TouchableOpacity 
+          style={styles.permissionButton}
+          onPress={() => {
+            requestCameraPermission();
+            requestMicrophonePermission();
+          }}
+        >
+          <Text style={styles.permissionButtonText}>Grant Permissions</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.container}>
+      <CameraView
+        ref={cameraRef}
+        style={styles.camera}
+        facing={facing}
+      >
+        {/* Recording indicator */}
+        {isRecording && (
+          <View style={styles.recordingIndicator}>
+            <View style={styles.recordingDot} />
+            <Text style={styles.recordingText}>REC {formatTime(recordingTime)}</Text>
+          </View>
+        )}
+
+        {/* Controls */}
+        <View style={styles.controls}>
+          {/* Cancel button */}
+          {!isRecording && onCancel && (
+            <TouchableOpacity style={styles.button} onPress={onCancel}>
+              <Text style={styles.buttonText}>✕</Text>
+            </TouchableOpacity>
+          )}
+
+          {/* Record/Stop button */}
+          <TouchableOpacity
+            style={[
+              styles.recordButton,
+              isRecording && styles.recordButtonActive
+            ]}
+            onPress={isRecording ? stopRecording : startRecording}
+          >
+            <View style={[
+              styles.recordButtonInner,
+              isRecording && styles.recordButtonInnerActive
+            ]} />
+          </TouchableOpacity>
+
+          {/* Flip camera button */}
+          {!isRecording && (
+            <TouchableOpacity style={styles.button} onPress={toggleCameraFacing}>
+              <Text style={styles.buttonText}>⟲</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
+        {/* Instructions */}
+        {!isRecording && (
+          <View style={styles.instructions}>
+            <Text style={styles.instructionText}>
+              Position yourself so your full shooting motion is visible
+            </Text>
+            <Text style={styles.instructionSubtext}>
+              Tap the circle to start recording
+            </Text>
+          </View>
+        )}
+      </CameraView>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#000',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  camera: {
+    flex: 1,
+    width: '100%',
+  },
+  text: {
+    fontSize: 18,
+    color: '#fff',
+    textAlign: 'center',
+    marginBottom: 10,
+  },
+  subtext: {
+    fontSize: 14,
+    color: '#999',
+    textAlign: 'center',
+    paddingHorizontal: 20,
+    marginBottom: 20,
+  },
+  permissionButton: {
+    backgroundColor: '#ff6b00',
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 8,
+  },
+  permissionButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  recordingIndicator: {
+    position: 'absolute',
+    top: 60,
+    left: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 0, 0, 0.8)',
+    paddingHorizontal: 15,
+    paddingVertical: 8,
+    borderRadius: 20,
+  },
+  recordingDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#fff',
+    marginRight: 8,
+  },
+  recordingText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  controls: {
+    position: 'absolute',
+    bottom: 40,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    paddingHorizontal: 40,
+  },
+  button: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: 'rgba(255, 255, 255, 0.3)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  buttonText: {
+    fontSize: 30,
+    color: '#fff',
+  },
+  recordButton: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: 'rgba(255, 255, 255, 0.3)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 4,
+    borderColor: '#fff',
+  },
+  recordButtonActive: {
+    backgroundColor: 'rgba(255, 0, 0, 0.5)',
+  },
+  recordButtonInner: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: '#ff0000',
+  },
+  recordButtonInnerActive: {
+    borderRadius: 8,
+    width: 40,
+    height: 40,
+  },
+  instructions: {
+    position: 'absolute',
+    top: 120,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    padding: 20,
+    borderRadius: 10,
+  },
+  instructionText: {
+    color: '#fff',
+    fontSize: 16,
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  instructionSubtext: {
+    color: '#aaa',
+    fontSize: 14,
+    textAlign: 'center',
+  },
+});

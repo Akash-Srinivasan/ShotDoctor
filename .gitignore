@@ -1,41 +1,276 @@
-# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+# =============================================================================
+# FormCheck - Comprehensive .gitignore
+# Protects API keys, credentials, and sensitive data
+# =============================================================================
 
-# dependencies
+# =============================================================================
+# CRITICAL: API Keys & Credentials
+# =============================================================================
+.env
+.env.local
+.env.development
+.env.production
+.env.*.local
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+
+# API keys in any config format
+*api_key*
+*apikey*
+*secret*
+*credentials*
+*token*
+
+# Supabase credentials
+.supabase/
+supabase-config.json
+
+# =============================================================================
+# Python / API Backend
+# =============================================================================
+# Virtual environments
+venv/
+env/
+ENV/
+api/venv/
+api/env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+formcheck.db
+*.db-journal
+
+# MediaPipe models
+pose_landmarker.task
+*.task
+
+# =============================================================================
+# Node / React Native / Expo
+# =============================================================================
 node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # Expo
 .expo/
+.expo-shared/
 dist/
 web-build/
-expo-env.d.ts
 
-# Native
-.kotlin/
-*.orig.*
-*.jks
-*.p8
-*.p12
-*.key
-*.mobileprovision
-
-# Metro
+# Metro bundler
 .metro-health-check*
 
-# debug
-npm-debug.*
-yarn-debug.*
-yarn-error.*
+# React Native
+*.jsbundle
+*.ipa
+*.apk
+*.aab
 
+# Build artifacts
+mobile/dist/
+mobile/build/
+mobile/.expo/
+mobile/.expo-shared/
+mobile/android/app/build/
+mobile/ios/build/
+mobile/ios/Pods/
+
+# =============================================================================
+# IDE / Editor
+# =============================================================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# =============================================================================
+# Operating System
+# =============================================================================
 # macOS
 .DS_Store
-*.pem
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
 
-# local env files
-.env*.local
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
 
-# typescript
-*.tsbuildinfo
+# Linux
+*~
+.directory
+.Trash-*
 
-# generated native folders
-/ios
-/android
+# =============================================================================
+# Project-Specific
+# =============================================================================
+# Uploaded videos (can be large)
+uploads/
+videos/
+*.mp4
+*.mov
+*.avi
+
+# Generated debug output
+debug_output/
+debug_frames/
+shot_*/
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+*.temp
+
+# Logs
+logs/
+*.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Session data
+sessions/
+
+# Cache directories
+.cache/
+*.cache
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# =============================================================================
+# Development Tools
+# =============================================================================
+# ngrok config (exposes tunnel URLs)
+ngrok.yml
+.ngrok2/
+
+# Docker
+.dockerignore
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# =============================================================================
+# Sensitive Output Files
+# =============================================================================
+# Any file containing "secret" or "key" in the name
+*secret*
+*private*
+*credential*
+
+# Test data that might contain PII
+test_data/
+user_data/
+
+# Analytics / metrics that might be sensitive
+analytics/
+metrics/
+
+# =============================================================================
+# Documentation with sensitive info
+# =============================================================================
+# Don't commit API documentation with examples that show real keys
+api_docs_private/
+internal_docs/
+
+# =============================================================================
+# IMPORTANT REMINDERS
+# =============================================================================
+# Always check before committing:
+# 1. Run: git status
+# 2. Verify no .env files are staged
+# 3. Check for hardcoded API keys in code
+# 4. Review diffs for sensitive data
+# 
+# If you accidentally commit sensitive data:
+# 1. Immediately rotate all exposed keys
+# 2. Use git filter-branch or BFG Repo-Cleaner to remove from history
+# 3. Force push the cleaned history
+# =============================================================================

@@ -1,20 +1,20 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, ActivityIndicator, ScrollView, TouchableOpacity, Image, Alert } from 'react-native';
 import { VideoView, useVideoPlayer } from 'expo-video';
 import * as ImagePicker from 'expo-image-picker';
 import { RecordingCamera } from '../components/Camera';
-import { analyzeVideo, type AnalyzeResponse } from '../lib/api';
+import { analyzeVideo, type SessionSummary } from '../lib/api';
 
 export default function RecordScreen() {
   const [showCamera, setShowCamera] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
-  const [result, setResult] = useState<AnalyzeResponse | null>(null);
+  const [result, setResult] = useState<SessionSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [shootingSide, setShootingSide] = useState<'left' | 'right'>('right');
   const [currentVideoUri, setCurrentVideoUri] = useState<string | null>(null);
+  const [analysisProgress, setAnalysisProgress] = useState('Uploading video...');
   
-  // CRITICAL: Call ALL hooks at top level, before any conditionals
-  // Video players for preview and replay
+  // Video players
   const previewPlayer = useVideoPlayer(currentVideoUri || '', (player) => {
     player.loop = true;
     player.play();
@@ -32,14 +32,12 @@ export default function RecordScreen() {
   };
 
   const handlePickVideo = async () => {
-    // Request permission
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Please grant access to your photos to upload videos');
+      Alert.alert('Permission needed', 'Please grant access to your photos');
       return;
     }
 
-    // Pick video - FIXED: Use array instead of MediaTypeOptions
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['videos'],
       allowsEditing: false,
@@ -58,8 +56,14 @@ export default function RecordScreen() {
     setAnalyzing(true);
     setError(null);
     setResult(null);
+    setAnalysisProgress('Uploading video...');
 
     try {
+      // Simulate progress updates
+      setTimeout(() => setAnalysisProgress('Detecting shots...'), 2000);
+      setTimeout(() => setAnalysisProgress('Analyzing form...'), 5000);
+      setTimeout(() => setAnalysisProgress('Generating feedback...'), 8000);
+      
       console.log('📤 Sending to API for analysis...');
       const analysis = await analyzeVideo(uri, shootingSide);
       console.log('✓ Analysis complete:', analysis);
@@ -90,8 +94,6 @@ export default function RecordScreen() {
     handlePickVideo();
   };
 
-  // All hooks are called above - now we can have conditionals
-
   if (showCamera) {
     return (
       <RecordingCamera
@@ -104,7 +106,6 @@ export default function RecordScreen() {
   if (analyzing) {
     return (
       <View style={styles.container}>
-        {/* Video Preview while analyzing */}
         {currentVideoUri && (
           <View style={styles.videoPreviewContainer}>
             <VideoView
@@ -117,26 +118,30 @@ export default function RecordScreen() {
         )}
 
         <ActivityIndicator size="large" color="#ff6b00" style={styles.loader} />
-        <Text style={styles.analyzingText}>Analyzing your shot...</Text>
+        <Text style={styles.analyzingText}>{analysisProgress}</Text>
         <Text style={styles.analyzingSubtext}>
-          This may take 30-60 seconds
+          This may take 30-90 seconds
         </Text>
         <Text style={styles.analyzingNote}>
-          • Detecting your shooting motion{'\n'}
+          • Scanning entire video{'\n'}
+          • Detecting all shots{'\n'}
           • Measuring form metrics{'\n'}
-          • Getting AI coaching feedback
+          • Getting AI coaching
         </Text>
       </View>
     );
   }
 
   if (result) {
+    const goodShots = result.shots.filter(s => s.form_rating && s.form_rating >= 7).length;
+    const needsWork = result.shots.filter(s => s.form_rating && s.form_rating < 7).length;
+
     return (
       <ScrollView style={styles.container} contentContainerStyle={styles.resultContainer}>
         {/* Video Replay */}
         {currentVideoUri && (
           <View style={styles.videoReplayContainer}>
-            <Text style={styles.videoReplayLabel}>Your Shot</Text>
+            <Text style={styles.videoReplayLabel}>Session Video</Text>
             <VideoView
               player={replayPlayer}
               style={styles.videoReplay}
@@ -146,91 +151,107 @@ export default function RecordScreen() {
           </View>
         )}
 
-        {/* Result Badge */}
-        <View style={[
-          styles.resultBadge,
-          result.made ? styles.resultBadgeMade : styles.resultBadgeMissed
-        ]}>
-          <Text style={styles.resultBadgeText}>
-            {result.made ? '✓ MADE' : '✗ MISSED'}
-          </Text>
-          {result.miss_type && (
-            <Text style={styles.missType}>({result.miss_type})</Text>
-          )}
+        {/* Session Stats */}
+        <View style={styles.statsCard}>
+          <Text style={styles.statsTitle}>Session Summary</Text>
+          
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Shots Taken:</Text>
+            <Text style={styles.statValue}>{result.total_shots}</Text>
+          </View>
+          
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Made:</Text>
+            <Text style={[styles.statValue, styles.statMade]}>{result.shots_made}</Text>
+          </View>
+          
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Missed:</Text>
+            <Text style={[styles.statValue, styles.statMissed]}>{result.shots_missed}</Text>
+          </View>
+          
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Shooting %:</Text>
+            <Text style={styles.statValue}>{result.shooting_percentage.toFixed(1)}%</Text>
+          </View>
+          
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Avg Form:</Text>
+            <Text style={styles.statValue}>{result.average_form_rating.toFixed(1)}/10</Text>
+          </View>
         </View>
 
-        {/* Form Rating */}
-        {result.form_rating && (
-          <View style={styles.ratingContainer}>
-            <Text style={styles.ratingLabel}>Form Rating</Text>
-            <Text style={styles.ratingValue}>{result.form_rating}/10</Text>
-          </View>
-        )}
-
-        {/* Feedback */}
-        <View style={styles.feedbackContainer}>
-          <Text style={styles.feedbackLabel}>💬 Coach's Feedback</Text>
-          <Text style={styles.feedbackText}>{result.feedback}</Text>
+        {/* Session Feedback */}
+        <View style={styles.feedbackCard}>
+          <Text style={styles.feedbackLabel}>💬 Coach's Assessment</Text>
+          <Text style={styles.feedbackText}>{result.session_feedback}</Text>
         </View>
 
-        {/* Quick Cue */}
-        {result.quick_cue && (
-          <View style={styles.cueContainer}>
-            <Text style={styles.cueLabel}>🎯 Remember</Text>
-            <Text style={styles.cueText}>"{result.quick_cue}"</Text>
-          </View>
-        )}
-
-        {/* Key Issue */}
-        {result.key_issue && result.key_issue.toLowerCase() !== 'none' && (
-          <View style={styles.issueContainer}>
-            <Text style={styles.issueLabel}>→ Fix</Text>
-            <Text style={styles.issueText}>{result.key_issue}</Text>
-          </View>
-        )}
-
-        {/* Shot Frames Section */}
-        {result.frames && result.frames.length > 0 && (
-          <View style={styles.framesContainer}>
-            <Text style={styles.framesLabel}>📸 Shot Breakdown</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-              {result.frames.map((frame, index) => (
-                <View key={index} style={styles.frameItem}>
-                  <Image 
-                    source={{ uri: `data:image/jpeg;base64,${frame.image_base64}` }} 
-                    style={styles.frameImage} 
-                  />
-                  <Text style={styles.frameLabel}>{frame.label.replace(/_/g, ' ')}</Text>
+        {/* All Shots */}
+        <View style={styles.shotsCard}>
+          <Text style={styles.shotsTitle}>📸 All Shots ({result.total_shots})</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.shotsScroll}>
+            {result.shots.map((shot) => (
+              <View key={shot.shot_number} style={styles.shotItem}>
+                <Image 
+                  source={{ uri: `data:image/jpeg;base64,${shot.thumbnail}` }}
+                  style={styles.shotThumbnail}
+                />
+                <View style={[
+                  styles.shotBadge,
+                  shot.made ? styles.shotBadgeMade : styles.shotBadgeMissed
+                ]}>
+                  <Text style={styles.shotBadgeText}>
+                    {shot.made ? '✓' : '✗'}
+                  </Text>
                 </View>
-              ))}
-            </ScrollView>
+                <Text style={styles.shotNumber}>Shot {shot.shot_number}</Text>
+                {shot.form_rating && (
+                  <Text style={styles.shotRating}>{shot.form_rating}/10</Text>
+                )}
+                {shot.quick_cue && (
+                  <Text style={styles.shotCue}>{shot.quick_cue}</Text>
+                )}
+              </View>
+            ))}
+          </ScrollView>
+        </View>
+
+        {/* Form Analysis */}
+        {(goodShots > 0 || needsWork > 0) && (
+          <View style={styles.formCard}>
+            <Text style={styles.formTitle}>📊 Form Breakdown</Text>
+            {goodShots > 0 && (
+              <View style={styles.formRow}>
+                <Text style={styles.formLabel}>✓ Good form:</Text>
+                <Text style={styles.formValue}>{goodShots} shots</Text>
+              </View>
+            )}
+            {needsWork > 0 && (
+              <View style={styles.formRow}>
+                <Text style={styles.formLabel}>→ Needs work:</Text>
+                <Text style={styles.formValue}>{needsWork} shots</Text>
+              </View>
+            )}
           </View>
         )}
 
-        {/* Metrics */}
-        <View style={styles.metricsContainer}>
-          <Text style={styles.metricsLabel}>📊 Metrics</Text>
-          <View style={styles.metricRow}>
-            <Text style={styles.metricLabel}>Elbow Load:</Text>
-            <Text style={styles.metricValue}>{result.elbow_angle_load.toFixed(0)}°</Text>
+        {/* Drill Suggestions */}
+        {result.drill_suggestions.length > 0 && (
+          <View style={styles.drillsCard}>
+            <Text style={styles.drillsTitle}>🏋️ Recommended Drills</Text>
+            {result.drill_suggestions.map((drill, index) => (
+              <View key={index} style={styles.drillItem}>
+                <Text style={styles.drillNumber}>{index + 1}</Text>
+                <Text style={styles.drillText}>{drill}</Text>
+              </View>
+            ))}
           </View>
-          <View style={styles.metricRow}>
-            <Text style={styles.metricLabel}>Elbow Release:</Text>
-            <Text style={styles.metricValue}>{result.elbow_angle_release.toFixed(0)}°</Text>
-          </View>
-          <View style={styles.metricRow}>
-            <Text style={styles.metricLabel}>Wrist Height:</Text>
-            <Text style={styles.metricValue}>{result.wrist_height_release.toFixed(2)}</Text>
-          </View>
-          <View style={styles.metricRow}>
-            <Text style={styles.metricLabel}>Knee Bend:</Text>
-            <Text style={styles.metricValue}>{result.knee_bend_load.toFixed(0)}°</Text>
-          </View>
-        </View>
+        )}
 
         {/* Action Buttons */}
         <TouchableOpacity style={styles.recordButton} onPress={startNewRecording}>
-          <Text style={styles.recordButtonText}>📹 Record Another Shot</Text>
+          <Text style={styles.recordButtonText}>📹 Record New Session</Text>
         </TouchableOpacity>
         
         <TouchableOpacity style={styles.uploadButton} onPress={startVideoUpload}>
@@ -252,7 +273,7 @@ export default function RecordScreen() {
     );
   }
 
-  // Default view - start recording or upload
+  // Welcome screen
   return (
     <View style={styles.container}>
       <View style={styles.welcomeContainer}>
@@ -260,53 +281,38 @@ export default function RecordScreen() {
         <Text style={styles.subtitle}>AI Basketball Coach</Text>
         
         <View style={styles.infoBox}>
-          <Text style={styles.infoTitle}>How it works:</Text>
-          <Text style={styles.infoText}>1. Record or upload a shot video</Text>
-          <Text style={styles.infoText}>2. Our AI analyzes your form</Text>
-          <Text style={styles.infoText}>3. Get instant coaching feedback</Text>
+          <Text style={styles.infoTitle}>New: Multi-Shot Analysis</Text>
+          <Text style={styles.infoText}>• Record multiple shots in one video</Text>
+          <Text style={styles.infoText}>• Get analysis for each shot</Text>
+          <Text style={styles.infoText}>• Session summary with drills</Text>
         </View>
 
-        {/* Shooting Side Toggle */}
         <View style={styles.toggleContainer}>
           <Text style={styles.toggleLabel}>Shooting Hand:</Text>
           <View style={styles.toggleButtons}>
             <TouchableOpacity
-              style={[
-                styles.toggleButton,
-                shootingSide === 'left' && styles.toggleButtonActive
-              ]}
+              style={[styles.toggleButton, shootingSide === 'left' && styles.toggleButtonActive]}
               onPress={() => setShootingSide('left')}
             >
-              <Text style={[
-                styles.toggleButtonText,
-                shootingSide === 'left' && styles.toggleButtonTextActive
-              ]}>
+              <Text style={[styles.toggleButtonText, shootingSide === 'left' && styles.toggleButtonTextActive]}>
                 Left
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
-              style={[
-                styles.toggleButton,
-                shootingSide === 'right' && styles.toggleButtonActive
-              ]}
+              style={[styles.toggleButton, shootingSide === 'right' && styles.toggleButtonActive]}
               onPress={() => setShootingSide('right')}
             >
-              <Text style={[
-                styles.toggleButtonText,
-                shootingSide === 'right' && styles.toggleButtonTextActive
-              ]}>
+              <Text style={[styles.toggleButtonText, shootingSide === 'right' && styles.toggleButtonTextActive]}>
                 Right
               </Text>
             </TouchableOpacity>
           </View>
         </View>
 
-        {/* Primary Action - Record */}
         <TouchableOpacity style={styles.startButton} onPress={startNewRecording}>
-          <Text style={styles.startButtonText}>📹 Record Shot</Text>
+          <Text style={styles.startButtonText}>📹 Record Session</Text>
         </TouchableOpacity>
 
-        {/* Secondary Action - Upload */}
         <TouchableOpacity style={styles.uploadButtonMain} onPress={startVideoUpload}>
           <Text style={styles.uploadButtonMainText}>📁 Upload Video</Text>
         </TouchableOpacity>
@@ -338,16 +344,18 @@ const styles = StyleSheet.create({
     marginBottom: 40,
   },
   infoBox: {
-    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    backgroundColor: 'rgba(255, 107, 0, 0.1)',
     padding: 20,
     borderRadius: 10,
     marginBottom: 30,
     width: '100%',
+    borderWidth: 1,
+    borderColor: '#ff6b00',
   },
   infoTitle: {
     fontSize: 18,
     fontWeight: 'bold',
-    color: '#fff',
+    color: '#ff6b00',
     marginBottom: 15,
   },
   infoText: {
@@ -434,6 +442,7 @@ const styles = StyleSheet.create({
     fontSize: 20,
     color: '#fff',
     marginTop: 20,
+    fontWeight: 'bold',
   },
   analyzingSubtext: {
     fontSize: 14,
@@ -465,46 +474,41 @@ const styles = StyleSheet.create({
     backgroundColor: '#111',
     borderRadius: 10,
   },
-  resultBadge: {
+  statsCard: {
+    backgroundColor: 'rgba(255, 107, 0, 0.1)',
     padding: 20,
     borderRadius: 10,
-    alignItems: 'center',
-    marginBottom: 20,
+    marginBottom: 15,
+    borderWidth: 1,
+    borderColor: '#ff6b00',
   },
-  resultBadgeMade: {
-    backgroundColor: 'rgba(0, 200, 0, 0.2)',
+  statsTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#ff6b00',
+    marginBottom: 15,
   },
-  resultBadgeMissed: {
-    backgroundColor: 'rgba(200, 0, 0, 0.2)',
+  statRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 10,
   },
-  resultBadgeText: {
-    fontSize: 28,
+  statLabel: {
+    fontSize: 16,
+    color: '#ddd',
+  },
+  statValue: {
+    fontSize: 16,
     fontWeight: 'bold',
     color: '#fff',
   },
-  missType: {
-    fontSize: 16,
-    color: '#aaa',
-    marginTop: 5,
+  statMade: {
+    color: '#00ff00',
   },
-  ratingContainer: {
-    backgroundColor: 'rgba(255, 255, 255, 0.1)',
-    padding: 20,
-    borderRadius: 10,
-    alignItems: 'center',
-    marginBottom: 20,
+  statMissed: {
+    color: '#ff6666',
   },
-  ratingLabel: {
-    fontSize: 16,
-    color: '#aaa',
-    marginBottom: 5,
-  },
-  ratingValue: {
-    fontSize: 36,
-    fontWeight: 'bold',
-    color: '#ff6b00',
-  },
-  feedbackContainer: {
+  feedbackCard: {
     backgroundColor: 'rgba(255, 255, 255, 0.05)',
     padding: 20,
     borderRadius: 10,
@@ -517,95 +521,133 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
   },
   feedbackText: {
-    fontSize: 18,
-    color: '#fff',
-    lineHeight: 26,
-  },
-  cueContainer: {
-    backgroundColor: 'rgba(255, 107, 0, 0.1)',
-    padding: 15,
-    borderRadius: 10,
-    marginBottom: 15,
-    borderLeftWidth: 4,
-    borderLeftColor: '#ff6b00',
-  },
-  cueLabel: {
-    fontSize: 14,
-    color: '#ff6b00',
-    marginBottom: 5,
-  },
-  cueText: {
-    fontSize: 20,
-    color: '#fff',
-    fontStyle: 'italic',
-  },
-  issueContainer: {
-    backgroundColor: 'rgba(255, 255, 255, 0.05)',
-    padding: 15,
-    borderRadius: 10,
-    marginBottom: 15,
-  },
-  issueLabel: {
-    fontSize: 14,
-    color: '#aaa',
-    marginBottom: 5,
-  },
-  issueText: {
     fontSize: 16,
     color: '#fff',
+    lineHeight: 24,
   },
-  framesContainer: {
+  shotsCard: {
     backgroundColor: 'rgba(255, 255, 255, 0.05)',
     padding: 15,
     borderRadius: 10,
     marginBottom: 15,
   },
-  framesLabel: {
+  shotsTitle: {
     fontSize: 16,
     color: '#ff6b00',
     marginBottom: 15,
     fontWeight: 'bold',
   },
-  frameItem: {
+  shotsScroll: {
+    marginHorizontal: -5,
+  },
+  shotItem: {
     marginRight: 10,
     alignItems: 'center',
+    position: 'relative',
   },
-  frameImage: {
-    width: 120,
-    height: 160,
+  shotThumbnail: {
+    width: 100,
+    height: 133,
     borderRadius: 8,
     backgroundColor: '#222',
   },
-  frameLabel: {
+  shotBadge: {
+    position: 'absolute',
+    top: 5,
+    right: 5,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  shotBadgeMade: {
+    backgroundColor: '#00ff00',
+  },
+  shotBadgeMissed: {
+    backgroundColor: '#ff0000',
+  },
+  shotBadgeText: {
+    color: '#000',
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  shotNumber: {
     fontSize: 12,
     color: '#aaa',
     marginTop: 5,
   },
-  metricsContainer: {
-    backgroundColor: 'rgba(255, 255, 255, 0.05)',
-    padding: 20,
-    borderRadius: 10,
-    marginBottom: 20,
-  },
-  metricsLabel: {
-    fontSize: 16,
+  shotRating: {
+    fontSize: 11,
     color: '#ff6b00',
-    marginBottom: 15,
     fontWeight: 'bold',
   },
-  metricRow: {
+  shotCue: {
+    fontSize: 10,
+    color: '#999',
+    textAlign: 'center',
+    marginTop: 2,
+  },
+  formCard: {
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    padding: 15,
+    borderRadius: 10,
+    marginBottom: 15,
+  },
+  formTitle: {
+    fontSize: 16,
+    color: '#ff6b00',
+    marginBottom: 10,
+    fontWeight: 'bold',
+  },
+  formRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: 10,
+    marginBottom: 8,
   },
-  metricLabel: {
+  formLabel: {
     fontSize: 14,
-    color: '#aaa',
+    color: '#ddd',
   },
-  metricValue: {
+  formValue: {
     fontSize: 14,
     color: '#fff',
     fontWeight: 'bold',
+  },
+  drillsCard: {
+    backgroundColor: 'rgba(255, 107, 0, 0.1)',
+    padding: 20,
+    borderRadius: 10,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: '#ff6b00',
+  },
+  drillsTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#ff6b00',
+    marginBottom: 15,
+  },
+  drillItem: {
+    flexDirection: 'row',
+    marginBottom: 12,
+  },
+  drillNumber: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#ff6b00',
+    color: '#fff',
+    textAlign: 'center',
+    lineHeight: 24,
+    fontWeight: 'bold',
+    marginRight: 10,
+  },
+  drillText: {
+    flex: 1,
+    fontSize: 14,
+    color: '#fff',
+    lineHeight: 24,
   },
   recordButton: {
     backgroundColor: '#ff6b00',

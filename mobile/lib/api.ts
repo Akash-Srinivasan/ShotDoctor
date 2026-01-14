@@ -1,19 +1,12 @@
 /**
- * API Client for FormCheck
- * Communicates with the FastAPI backend (via ngrok in dev)
+ * API Client for FormCheck - Multi-Shot Analysis
  */
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:8000';
 
 console.log('🔗 API URL configured:', API_URL);
 
-export interface ShotFrame {
-  label: string;
-  image_base64: string;
-  frame_number: number;
-}
-
-export interface AnalyzeResponse {
+export interface ShotAnalysis {
   shot_number: number;
   made: boolean | null;
   miss_type: string | null;
@@ -25,7 +18,18 @@ export interface AnalyzeResponse {
   elbow_angle_release: number;
   wrist_height_release: number;
   knee_bend_load: number;
-  frames?: ShotFrame[];
+  thumbnail: string; // Base64 encoded
+}
+
+export interface SessionSummary {
+  total_shots: number;
+  shots_made: number;
+  shots_missed: number;
+  shooting_percentage: number;
+  average_form_rating: number;
+  session_feedback: string;
+  drill_suggestions: string[];
+  shots: ShotAnalysis[];
 }
 
 /**
@@ -65,13 +69,13 @@ export async function checkHealth(): Promise<{
 }
 
 /**
- * Upload and analyze a video
+ * Upload and analyze a video - Returns complete session summary
  */
 export async function analyzeVideo(
   videoUri: string,
   shootingSide: 'left' | 'right' = 'right',
   playerId?: number
-): Promise<AnalyzeResponse> {
+): Promise<SessionSummary> {
   try {
     // Create form data
     const formData = new FormData();
@@ -114,7 +118,7 @@ export async function analyzeVideo(
       
       // Handle specific errors
       if (response.status === 404) {
-        throw new Error('No shot detected in video. Make sure you capture a clear shooting motion with your full body visible.');
+        throw new Error('No shots detected in video. Make sure you capture clear shooting motions with your full body visible.');
       }
       
       throw new Error(errorData.detail || `API error: ${response.status}`);
@@ -122,10 +126,11 @@ export async function analyzeVideo(
     
     const data = await response.json();
     console.log('✓ Analysis complete:', {
-      made: data.made,
-      rating: data.form_rating,
-      feedback: data.feedback?.substring(0, 50) + '...',
-      frames: data.frames?.length || 0,
+      total_shots: data.total_shots,
+      made: data.shots_made,
+      missed: data.shots_missed,
+      percentage: data.shooting_percentage,
+      avg_rating: data.average_form_rating,
     });
     
     return data;

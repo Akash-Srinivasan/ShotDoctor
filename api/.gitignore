@@ -1,0 +1,32 @@
+# Virtual environments
+venv/
+.venv/
+core/venv/
+
+# YOLO training data (not needed, only .pt weights needed)
+core/YOLOBball-3/
+core/basketball_detector/
+
+# Video files
+*.mp4
+*.mov
+*.avi
+
+# Debug output
+debug_frames/
+*_debug*.mp4
+*_annotated.mp4
+
+# Cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Environment
+.env
+
+# OS
+.DS_Store
+
+# Expo
+.expo/

@@ -1,0 +1,37 @@
+# Virtual environments
+venv/
+.venv/
+core/venv/
+
+# YOLO training data (not needed for inference)
+core/YOLOBball-3/
+core/basketball_detector/
+
+# Video files (test data)
+*.mp4
+*.mov
+*.avi
+
+# Debug output
+debug_frames/
+debug_output.mp4
+*_debug*.mp4
+*_annotated.mp4
+
+# Cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Expo (shouldn't be here but just in case)
+.expo/
+
+# Environment (will be set in Railway dashboard)
+.env

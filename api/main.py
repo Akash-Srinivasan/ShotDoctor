@@ -6,6 +6,7 @@ Processes ALL shots in a video and returns session summary
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional, List
 import uvicorn
@@ -69,52 +70,21 @@ app.add_middleware(
 GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY", "")
 db = FormCheckDB() if MODULES_AVAILABLE else None
 
-# Lightweight Supabase PostgREST client (bypasses buggy supabase-py proxy kwarg)
-import httpx
+# Official Supabase client (proxy bug fixed in v2.28.0+)
+from supabase import create_client, Client
 
-class _SupabaseQuery:
-    """Minimal PostgREST query builder matching the supabase-py chaining API."""
-    def __init__(self, url: str, key: str, table_name: str):
-        self._url = f"{url}/rest/v1/{table_name}"
-        self._headers = {
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        }
-        self._params: dict = {}
-
-    def select(self, columns: str = "*"):
-        self._params["select"] = columns
-        return self
-
-    def eq(self, column: str, value):
-        self._params[column] = f"eq.{value}"
-        return self
-
-    def order(self, column: str, desc: bool = False):
-        self._params["order"] = f"{column}.{'desc' if desc else 'asc'}"
-        return self
-
-    def execute(self):
-        resp = httpx.get(self._url, headers=self._headers, params=self._params, timeout=10)
-        resp.raise_for_status()
-        return type("Result", (), {"data": resp.json()})()
-
-class _SupabaseClient:
-    def __init__(self, url: str, key: str):
-        self.url = url
-        self.key = key
-    def table(self, name: str):
-        return _SupabaseQuery(self.url, self.key, name)
-
-_supabase_client = None
+_supabase_client: Optional[Client] = None
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-    _supabase_client = _SupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    print("✓ Supabase client initialized (direct PostgREST)")
+    try:
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        print("✓ Supabase client initialized (official supabase-py)")
+    except Exception as e:
+        print(f"⚠️  Supabase client initialization failed: {e}")
+        _supabase_client = None
 else:
-    print("⚠️  Supabase credentials not set — fingerprint and user context disabled")
+    print("⚠️  Supabase credentials not set — fingerprint and server-side persistence disabled")
 
 # In-memory progress tracking for active analyses
 # Key: session_id, Value: {stage, progress, message, frame, total_frames, shots_found}
@@ -181,6 +151,7 @@ class SessionSummary(BaseModel):
     session_feedback: str
     drill_suggestions: List[str]
     shots: List[ShotAnalysis]
+    server_persisted: bool = False  # True if server wrote to DB (client can skip)
 
 class HealthResponse(BaseModel):
     status: str
@@ -262,6 +233,98 @@ class ShotFingerprint(BaseModel):
     miss_tendency_cue: str = ""
     trend_label: str = ""
     consistency_note: str = ""
+
+
+def _persist_session_results(
+    session_id: str,
+    user_id: str,
+    session_summary: SessionSummary,
+    started_at: str
+) -> bool:
+    """
+    Persist session results to Supabase (server-side).
+
+    Returns True if successful, False otherwise.
+    This runs in a try/except so DB failures don't crash the API response.
+    """
+    if not _supabase_client or not session_id or not user_id:
+        return False
+
+    try:
+        persist_start = time.time()
+
+        # 1. Update session with final stats
+        session_update = {
+            "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "shot_count": session_summary.total_shots,
+            "make_count": session_summary.shots_made,
+            "miss_count": session_summary.shots_missed,
+            "shooting_percentage": session_summary.shooting_percentage,
+            "average_form_rating": session_summary.average_form_rating,
+            "session_feedback": session_summary.session_feedback,
+            "drill_suggestions": session_summary.drill_suggestions,
+        }
+
+        _supabase_client.table("sessions").update(session_update).eq("id", session_id).execute()
+        print(f"✓ Server: Updated session {session_id}")
+
+        # 2. Batch insert all shots
+        shots_data = []
+        for shot in session_summary.shots:
+            shot_row = {
+                "session_id": session_id,
+                "user_id": user_id,
+                "shot_number": shot.shot_number,
+                "made": shot.made,
+                "miss_type": shot.miss_type,
+                "elbow_angle_load": shot.elbow_angle_load,
+                "elbow_angle_release": shot.elbow_angle_release,
+                "wrist_height_release": shot.wrist_height_release,
+                "knee_bend_load": shot.knee_bend_load,
+                "hip_angle_load": shot.hip_angle_load,
+                "elbow_height_load": shot.elbow_height_load,
+                "heel_height_release": shot.heel_height_release,
+                "trunk_lean_release": shot.trunk_lean_release,
+                "stance_width": shot.stance_width,
+                "shoulder_level_diff": shot.shoulder_level_diff,
+                "elbow_lateral_offset": shot.elbow_lateral_offset,
+                "form_rating": shot.form_rating,
+                "feedback": shot.feedback,
+                "key_issue": shot.key_issue,
+                "quick_cue": shot.quick_cue,
+                "camera_angle": shot.camera_angle,
+                "thumbnail_url": None,  # Client may upload thumbnails separately
+            }
+            shots_data.append(shot_row)
+
+        if shots_data:
+            _supabase_client.table("shots").insert(shots_data).execute()
+            print(f"✓ Server: Inserted {len(shots_data)} shots")
+
+        # 3. Update user profile stats
+        # Get current profile
+        profile_resp = _supabase_client.table("profiles").select("total_sessions, total_shots, total_makes").eq("id", user_id).single().execute()
+        current_profile = profile_resp.data if profile_resp.data else {}
+
+        profile_update = {
+            "total_sessions": (current_profile.get("total_sessions", 0) or 0) + 1,
+            "total_shots": (current_profile.get("total_shots", 0) or 0) + session_summary.total_shots,
+            "total_makes": (current_profile.get("total_makes", 0) or 0) + session_summary.shots_made,
+            "last_session_at": started_at,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        }
+        _supabase_client.table("profiles").update(profile_update).eq("id", user_id).execute()
+        print(f"✓ Server: Updated profile stats for user {user_id}")
+
+        persist_duration = time.time() - persist_start
+        print(f"✅ Server-side persistence complete ({persist_duration:.2f}s)")
+        return True
+
+    except Exception as e:
+        print(f"❌ Server-side persistence failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def _compute_fingerprint(user_id: str) -> dict:
@@ -1759,8 +1822,8 @@ Focus on:
         update_progress("complete", 100, "Analysis complete!",
                         shots_found=total)
 
-        # Return complete session summary
-        return SessionSummary(
+        # Build complete session summary
+        session_summary = SessionSummary(
             total_shots=total,
             shots_made=makes,
             shots_missed=misses,
@@ -1768,8 +1831,34 @@ Focus on:
             average_form_rating=avg_rating,
             session_feedback=summary_result.get("session_feedback", ""),
             drill_suggestions=summary_result.get("drill_suggestions", []),
-            shots=analyzed_shots
+            shots=analyzed_shots,
+            server_persisted=False,
         )
+
+        # Attempt server-side persistence (non-blocking — don't fail response if DB write fails)
+        if session_id and user_id:
+            # We need started_at from the session — try to fetch it or use current time
+            started_at = None
+            if _supabase_client:
+                try:
+                    session_resp = _supabase_client.table("sessions").select("started_at").eq("id", session_id).single().execute()
+                    started_at = session_resp.data.get("started_at") if session_resp.data else None
+                except Exception:
+                    pass
+            if not started_at:
+                started_at = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+
+            persistence_success = _persist_session_results(
+                session_id=session_id,
+                user_id=user_id,
+                session_summary=session_summary,
+                started_at=started_at
+            )
+            session_summary.server_persisted = persistence_success
+        else:
+            print("⚠️  Skipping server-side persistence (no session_id or user_id)")
+
+        return session_summary
 
     except Exception as e:
         print(f"❌ Analysis error: {e}")

@@ -3,7 +3,7 @@
  * Clean profile with bold stats and minimal design
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -18,8 +18,9 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../contexts/AuthContext';
+import { ErrorBoundary } from '../../components/ErrorBoundary';
 
-export default function ProfileScreen() {
+function ProfileScreen() {
   const router = useRouter();
   const { user, profile, signOut, updateProfile, refreshProfile } = useAuth();
   const [editing, setEditing] = useState(false);
@@ -28,6 +29,7 @@ export default function ProfileScreen() {
   // Edit form state
   const [editedName, setEditedName] = useState(profile?.full_name || '');
   const [editedGoal, setEditedGoal] = useState(profile?.primary_goal || '');
+
 
   const handleSaveProfile = async () => {
     if (!editedName) {
@@ -229,9 +231,9 @@ export default function ProfileScreen() {
         <View style={styles.settingsSection}>
           <Text style={styles.sectionTitle}>Settings</Text>
           
-          <TouchableOpacity 
+          <TouchableOpacity
             style={styles.settingRow}
-            onPress={() => router.push('/onboarding')}
+            onPress={() => router.push('/edit-preferences')}
           >
             <Text style={styles.settingText}>Edit Preferences</Text>
             <Ionicons name="chevron-forward" size={18} color="#666" />
@@ -266,6 +268,14 @@ export default function ProfileScreen() {
         <Text style={styles.version}>FormCheck v1.0.0</Text>
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+export default function ProfileScreenWithBoundary() {
+  return (
+    <ErrorBoundary>
+      <ProfileScreen />
+    </ErrorBoundary>
   );
 }
 

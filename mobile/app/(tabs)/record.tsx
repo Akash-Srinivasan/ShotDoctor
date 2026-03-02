@@ -8,7 +8,8 @@
  * - Added SafeAreaView for iOS notch/camera island support
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useFocusEffect } from 'expo-router';
 import {
   View,
   Text,
@@ -18,21 +19,32 @@ import {
   TouchableOpacity,
   Image,
   Alert,
+  Modal,
+  Dimensions,
+  Animated,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { VideoView, useVideoPlayer } from 'expo-video';
 import * as ImagePicker from 'expo-image-picker';
 import { RecordingCamera } from '../../components/Camera';
-import { analyzeVideo, type SessionSummary, type AnalysisProgress } from '../../lib/api';
+import { ShotMarkerTimeline } from '../../components/ShotMarkerTimeline';
+import { RimCalibrationOverlay, type RimPosition } from '../../components/RimCalibrationOverlay';
+import { analyzeVideoWithProgress, type SessionSummary, type AnalysisProgress, type ShotAnalysis, type UserContext } from '../../lib/api';
 import { useAuth } from '../../contexts/AuthContext';
+import { useFingerprint } from '../../contexts/FingerprintContext';
+import { ErrorBoundary } from '../../components/ErrorBoundary';
 import { db } from '../../lib/supabase';
 
-export default function RecordScreen() {
+function RecordScreen() {
   // Auth context
   const { user, profile } = useAuth();
+  const { refreshFingerprint } = useFingerprint();
   
   // UI State
   const [showCamera, setShowCamera] = useState(false);
+  const [showCalibration, setShowCalibration] = useState(false);
+  const [pendingVideoUri, setPendingVideoUri] = useState<string | null>(null);
+  const [rimPosition, setRimPosition] = useState<RimPosition | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [result, setResult] = useState<SessionSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,6 +58,12 @@ export default function RecordScreen() {
     message: 'Preparing...',
   });
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [videoDuration, setVideoDuration] = useState<number>(0);
+
+  // Shot detail modal state
+  const [selectedShot, setSelectedShot] = useState<ShotAnalysis | null>(null);
+  const [modalVisible, setModalVisible] = useState(false);
+  const [modalAnimation] = useState(new Animated.Value(0));
 
   // Update shooting side from profile when it loads
   useEffect(() => {
@@ -53,6 +71,33 @@ export default function RecordScreen() {
       setShootingSide(profile.shooting_hand);
     }
   }, [profile?.shooting_hand]);
+
+  // Track if we've left this screen while showing results
+  const hadResultOnBlur = useRef(false);
+
+  // Reset state when returning to this screen after viewing results
+  // This ensures "Start Recording" from Home always starts fresh
+  useFocusEffect(
+    useCallback(() => {
+      // On focus: if we previously had results and left, reset now
+      if (hadResultOnBlur.current) {
+        setResult(null);
+        setError(null);
+        setCurrentVideoUri(null);
+        setRimPosition(null);
+        setShowCamera(false);
+        setShowCalibration(false);
+        hadResultOnBlur.current = false;
+      }
+
+      // On blur: remember if we had results showing
+      return () => {
+        if (result && !analyzing) {
+          hadResultOnBlur.current = true;
+        }
+      };
+    }, [result, analyzing])
+  );
 
   // Video players
   const previewPlayer = useVideoPlayer(currentVideoUri || '', (player) => {
@@ -82,15 +127,97 @@ export default function RecordScreen() {
     };
   }, [previewPlayer, replayPlayer]);
 
-  // Handle video from camera
+  // Track video duration from replay player
+  useEffect(() => {
+    if (replayPlayer && replayPlayer.duration > 0) {
+      setVideoDuration(replayPlayer.duration);
+    }
+  }, [replayPlayer, replayPlayer?.duration]);
+
+  // Seek handler for timeline markers
+  const handleTimelineSeek = useCallback((timestamp: number) => {
+    if (replayPlayer) {
+      replayPlayer.currentTime = timestamp;
+      replayPlayer.play();
+    }
+  }, [replayPlayer]);
+
+  // Open shot detail modal with animation
+  const openShotModal = useCallback((shot: ShotAnalysis) => {
+    setSelectedShot(shot);
+    setModalVisible(true);
+    Animated.spring(modalAnimation, {
+      toValue: 1,
+      useNativeDriver: true,
+      tension: 50,
+      friction: 7,
+    }).start();
+  }, [modalAnimation]);
+
+  // Close shot detail modal with animation
+  const closeShotModal = useCallback(() => {
+    Animated.timing(modalAnimation, {
+      toValue: 0,
+      duration: 200,
+      useNativeDriver: true,
+    }).start(() => {
+      setModalVisible(false);
+      setSelectedShot(null);
+    });
+  }, [modalAnimation]);
+
+  // Handle video from camera - show calibration first
   const handleVideoRecorded = useCallback(async (uri: string) => {
     console.log('📹 Video recorded:', uri);
     setShowCamera(false);
-    setCurrentVideoUri(uri);
-    await analyzeVideoFile(uri);
-  }, [shootingSide, user]);
+    setPendingVideoUri(uri);
+    setShowCalibration(true);
+  }, []);
 
-  // Handle video from library
+  // Handle rim calibration confirmation
+  const handleRimConfirm = useCallback(async (position: RimPosition) => {
+    console.log('🎯 Rim position set:', position);
+    setRimPosition(position);
+    setShowCalibration(false);
+    if (pendingVideoUri) {
+      setCurrentVideoUri(pendingVideoUri);
+      await analyzeVideoFile(pendingVideoUri, position);
+    }
+  }, [pendingVideoUri, shootingSide, user]);
+
+  // Handle rim calibration skip
+  const handleRimSkip = useCallback(async () => {
+    console.log('⏭️ Rim calibration skipped');
+    setRimPosition(null);
+    setShowCalibration(false);
+    if (pendingVideoUri) {
+      setCurrentVideoUri(pendingVideoUri);
+      await analyzeVideoFile(pendingVideoUri, null);
+    }
+  }, [pendingVideoUri, shootingSide, user]);
+
+  // Handle rim not visible in video
+  const handleRimNotVisible = useCallback(async () => {
+    console.log('👁️ Rim marked as not visible');
+    setRimPosition(null);
+    setShowCalibration(false);
+    if (pendingVideoUri) {
+      setCurrentVideoUri(pendingVideoUri);
+      // Pass null - backend will know to not guess make/miss
+      await analyzeVideoFile(pendingVideoUri, null);
+    }
+  }, [pendingVideoUri, shootingSide, user]);
+
+  // Handle change video - go back to select a different video
+  const handleChangeVideo = useCallback(() => {
+    console.log('🔄 Changing video');
+    setPendingVideoUri(null);
+    setCurrentVideoUri(null);
+    setRimPosition(null);
+    setShowCalibration(false);
+  }, []);
+
+  // Handle video from library - show calibration first
   const handlePickVideo = useCallback(async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
@@ -107,13 +234,13 @@ export default function RecordScreen() {
     if (!pickerResult.canceled && pickerResult.assets[0]) {
       const uri = pickerResult.assets[0].uri;
       console.log('📁 Video selected:', uri);
-      setCurrentVideoUri(uri);
-      await analyzeVideoFile(uri);
+      setPendingVideoUri(uri);
+      setShowCalibration(true);
     }
-  }, [shootingSide, user]);
+  }, []);
 
   // Core analysis function
-  const analyzeVideoFile = async (uri: string) => {
+  const analyzeVideoFile = async (uri: string, rimPos: RimPosition | null = null) => {
     setAnalyzing(true);
     setError(null);
     setResult(null);
@@ -141,28 +268,27 @@ export default function RecordScreen() {
         }
       }
 
-      // Progress simulation (until we implement real progress tracking)
-      const progressStages: AnalysisProgress[] = [
-        { stage: 'uploading', progress: 20, message: 'Uploading video...' },
-        { stage: 'detecting', progress: 40, message: 'Detecting shots...' },
-        { stage: 'analyzing', progress: 60, message: 'Analyzing form...' },
-        { stage: 'generating', progress: 80, message: 'Generating feedback...' },
-      ];
+      // Build user context for personalized analysis
+      const userContext: UserContext = {
+        skill_level: profile?.skill_level || undefined,
+        focus_areas: profile?.focus_areas?.join(', ') || undefined,
+        height_inches: profile?.height_inches || undefined,
+        user_id: user?.id || undefined,
+      };
 
-      let stageIndex = 0;
-      const progressInterval = setInterval(() => {
-        if (stageIndex < progressStages.length) {
-          setAnalysisProgress(progressStages[stageIndex]);
-          stageIndex++;
-        }
-      }, 2500);
-
-      // Call API
+      // Call API with real progress polling
       console.log('📤 Sending to API for analysis...');
-      const analysis = await analyzeVideo(uri, shootingSide);
+      console.log('🎯 Rim position:', rimPos ? `(${rimPos.x.toFixed(3)}, ${rimPos.y.toFixed(3)})` : 'not set');
+      const analysis = await analyzeVideoWithProgress(
+        uri,
+        shootingSide,
+        (progress) => setAnalysisProgress(progress),
+        rimPos,
+        undefined,
+        newSessionId || undefined,
+        userContext
+      );
       console.log('✅ Analysis complete:', analysis.total_shots, 'shots');
-      
-      clearInterval(progressInterval);
 
       // Save results to database
       if (user && newSessionId) {
@@ -179,25 +305,52 @@ export default function RecordScreen() {
             drill_suggestions: analysis.drill_suggestions,
           });
 
-          // Create shot records
-          const shotRecords = analysis.shots.map((shot) => ({
-            session_id: newSessionId!,
-            shot_number: shot.shot_number,
-            made: shot.made,
-            miss_type: shot.miss_type,
-            elbow_angle_load: shot.elbow_angle_load,
-            elbow_angle_release: shot.elbow_angle_release,
-            wrist_height_release: shot.wrist_height_release,
-            knee_bend_load: shot.knee_bend_load,
-            form_rating: shot.form_rating,
-            feedback: shot.feedback,
-            key_issue: shot.key_issue,
-            quick_cue: shot.quick_cue,
-            thumbnail_url: null, // TODO: Upload thumbnails to storage
-          }));
+          // Upload thumbnails and create shot records
+          const shotRecords = await Promise.all(
+            analysis.shots.map(async (shot) => {
+              let thumbnailUrl: string | null = null;
+              if (shot.thumbnail) {
+                try {
+                  thumbnailUrl = await db.uploadThumbnail(
+                    newSessionId!,
+                    shot.shot_number,
+                    shot.thumbnail
+                  );
+                } catch (thumbErr) {
+                  console.warn(`Thumbnail upload failed for shot ${shot.shot_number}:`, thumbErr);
+                }
+              }
+              return {
+                session_id: newSessionId!,
+                shot_number: shot.shot_number,
+                made: shot.made,
+                miss_type: shot.miss_type,
+                elbow_angle_load: shot.elbow_angle_load,
+                elbow_angle_release: shot.elbow_angle_release,
+                wrist_height_release: shot.wrist_height_release,
+                knee_bend_load: shot.knee_bend_load,
+                hip_angle_load: shot.hip_angle_load,
+                elbow_height_load: shot.elbow_height_load,
+                heel_height_release: shot.heel_height_release,
+                trunk_lean_release: shot.trunk_lean_release,
+                stance_width: shot.stance_width,
+                shoulder_level_diff: shot.shoulder_level_diff,
+                elbow_lateral_offset: shot.elbow_lateral_offset,
+                form_rating: shot.form_rating,
+                feedback: shot.feedback,
+                key_issue: shot.key_issue,
+                quick_cue: shot.quick_cue,
+                camera_angle: shot.camera_angle,
+                thumbnail_url: thumbnailUrl,
+              };
+            })
+          );
 
           await db.createShots(shotRecords);
           console.log('💾 Session saved to database');
+
+          // Refresh fingerprint in background so home screen shows updated data
+          refreshFingerprint().catch(() => {});
         } catch (dbError) {
           console.warn('Could not save session to database:', dbError);
           // Don't fail the whole analysis if DB save fails
@@ -215,10 +368,27 @@ export default function RecordScreen() {
     } catch (err: unknown) {
       console.error('❌ Analysis error:', err);
       const errorMessage = err instanceof Error ? err.message : 'Failed to analyze video';
+
+      // Server finished but connection was lost — redirect to history
+      const isConnectionLost = err instanceof Error && err.message === 'ANALYSIS_COMPLETE_CONNECTION_LOST';
+      if (isConnectionLost) {
+        setAnalysisProgress({
+          stage: 'complete',
+          progress: 100,
+          message: 'Analysis complete! Redirecting...',
+        });
+        // Session data was saved server-side, navigate to history
+        router.push('/(tabs)/history');
+        return;
+      }
+
       setError(errorMessage);
 
-      // Clean up failed session
-      if (newSessionId && user) {
+      // Only clean up the session if it was NOT a timeout/connection issue
+      // These mean the API may still be running — the session could be populated later
+      const isServerStillProcessing = err instanceof Error &&
+        (err.message.includes('timed out') || err.message.includes('still processing'));
+      if (newSessionId && user && !isServerStillProcessing) {
         try {
           await db.deleteSession(newSessionId);
         } catch {
@@ -238,6 +408,8 @@ export default function RecordScreen() {
     setResult(null);
     setError(null);
     setCurrentVideoUri(null);
+    setPendingVideoUri(null);
+    setRimPosition(null);
     setSessionId(null);
     setShowCamera(true);
   }, []);
@@ -246,6 +418,8 @@ export default function RecordScreen() {
     setResult(null);
     setError(null);
     setCurrentVideoUri(null);
+    setPendingVideoUri(null);
+    setRimPosition(null);
     setSessionId(null);
     handlePickVideo();
   }, [handlePickVideo]);
@@ -253,7 +427,7 @@ export default function RecordScreen() {
   // ============================================================================
   // Render: Camera
   // ============================================================================
-  
+
   if (showCamera) {
     return (
       <RecordingCamera
@@ -264,22 +438,41 @@ export default function RecordScreen() {
   }
 
   // ============================================================================
+  // Render: Rim Calibration
+  // ============================================================================
+
+  if (showCalibration) {
+    return (
+      <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
+        <RimCalibrationOverlay
+          onConfirm={handleRimConfirm}
+          onRimNotVisible={handleRimNotVisible}
+          onSkip={handleRimSkip}
+          onChangeVideo={handleChangeVideo}
+          videoUri={pendingVideoUri}
+        />
+      </SafeAreaView>
+    );
+  }
+
+  // ============================================================================
   // Render: Analyzing
   // ============================================================================
   
   if (analyzing) {
     return (
-      <View style={styles.container}>
-        {currentVideoUri && (
-          <View style={styles.videoPreviewContainer}>
-            <VideoView
-              player={previewPlayer}
-              style={styles.videoPreview}
-              nativeControls={false}
-              contentFit="contain"
-            />
-          </View>
-        )}
+      <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
+        <View style={styles.container}>
+          {currentVideoUri && (
+            <View style={styles.videoPreviewContainer}>
+              <VideoView
+                player={previewPlayer}
+                style={styles.videoPreview}
+                nativeControls={false}
+                contentFit="contain"
+              />
+            </View>
+          )}
 
         <ActivityIndicator size="large" color="#ff6b00" style={styles.loader} />
         
@@ -296,7 +489,10 @@ export default function RecordScreen() {
         </View>
         
         <Text style={styles.analyzingSubtext}>
-          This may take 30-90 seconds
+          {analysisProgress.frame && analysisProgress.totalFrames
+            ? `Frame ${analysisProgress.frame} / ${analysisProgress.totalFrames}`
+            : 'This may take 30-90 seconds'}
+          {analysisProgress.shotsFound ? ` — ${analysisProgress.shotsFound} shot${analysisProgress.shotsFound !== 1 ? 's' : ''} found` : ''}
         </Text>
         
         <Text style={styles.analyzingNote}>
@@ -305,7 +501,8 @@ export default function RecordScreen() {
           • Measuring form metrics{'\n'}
           • Getting AI coaching
         </Text>
-      </View>
+        </View>
+      </SafeAreaView>
     );
   }
 
@@ -330,6 +527,12 @@ export default function RecordScreen() {
               nativeControls={true}
               contentFit="contain"
             />
+            {/* Shot Marker Timeline */}
+            <ShotMarkerTimeline
+              shots={result.shots}
+              videoDuration={videoDuration}
+              onSeek={handleTimelineSeek}
+            />
           </View>
         )}
 
@@ -342,20 +545,30 @@ export default function RecordScreen() {
             <Text style={styles.statValue}>{result.total_shots}</Text>
           </View>
 
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Made:</Text>
-            <Text style={[styles.statValue, styles.statMade]}>{result.shots_made}</Text>
-          </View>
+          {/* Only show make/miss stats if rim was tracked */}
+          {(result.shots_made > 0 || result.shots_missed > 0) ? (
+            <>
+              <View style={styles.statRow}>
+                <Text style={styles.statLabel}>Made:</Text>
+                <Text style={[styles.statValue, styles.statMade]}>{result.shots_made}</Text>
+              </View>
 
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Missed:</Text>
-            <Text style={[styles.statValue, styles.statMissed]}>{result.shots_missed}</Text>
-          </View>
+              <View style={styles.statRow}>
+                <Text style={styles.statLabel}>Missed:</Text>
+                <Text style={[styles.statValue, styles.statMissed]}>{result.shots_missed}</Text>
+              </View>
 
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Shooting %:</Text>
-            <Text style={styles.statValue}>{result.shooting_percentage.toFixed(1)}%</Text>
-          </View>
+              <View style={styles.statRow}>
+                <Text style={styles.statLabel}>Shooting %:</Text>
+                <Text style={styles.statValue}>{result.shooting_percentage.toFixed(1)}%</Text>
+              </View>
+            </>
+          ) : (
+            <View style={styles.statRow}>
+              <Text style={styles.statLabel}>Accuracy:</Text>
+              <Text style={[styles.statValue, { color: '#888' }]}>N/A (no rim marked)</Text>
+            </View>
+          )}
 
           <View style={styles.statRow}>
             <Text style={styles.statLabel}>Avg Form:</Text>
@@ -372,9 +585,15 @@ export default function RecordScreen() {
         {/* All Shots */}
         <View style={styles.shotsCard}>
           <Text style={styles.shotsTitle}>📸 All Shots ({result.total_shots})</Text>
+          <Text style={styles.shotsSubtitle}>Tap to expand</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.shotsScroll}>
             {result.shots.map((shot) => (
-              <View key={shot.shot_number} style={styles.shotItem}>
+              <TouchableOpacity
+                key={shot.shot_number}
+                style={styles.shotItem}
+                onPress={() => openShotModal(shot)}
+                activeOpacity={0.7}
+              >
                 <Image
                   source={{ uri: `data:image/jpeg;base64,${shot.thumbnail}` }}
                   style={styles.shotThumbnail}
@@ -382,21 +601,26 @@ export default function RecordScreen() {
                 <View
                   style={[
                     styles.shotBadge,
-                    shot.made ? styles.shotBadgeMade : styles.shotBadgeMissed,
+                    shot.made === true ? styles.shotBadgeMade :
+                    shot.made === false ? styles.shotBadgeMissed :
+                    styles.shotBadgeUnknown,
                   ]}
                 >
                   <Text style={styles.shotBadgeText}>
-                    {shot.made ? '✓' : '✗'}
+                    {shot.made === true ? '✓' : shot.made === false ? '✗' : '?'}
                   </Text>
                 </View>
+                <View style={styles.expandIndicator}>
+                  <Text style={styles.expandIndicatorText}>+</Text>
+                </View>
                 <Text style={styles.shotNumber}>Shot {shot.shot_number}</Text>
+                {shot.camera_angle && (
+                  <Text style={styles.shotAngleLabel}>{shot.camera_angle.toUpperCase()}</Text>
+                )}
                 {shot.form_rating && (
                   <Text style={styles.shotRating}>{shot.form_rating}/10</Text>
                 )}
-                {shot.quick_cue && (
-                  <Text style={styles.shotCue}>{shot.quick_cue}</Text>
-                )}
-              </View>
+              </TouchableOpacity>
             ))}
           </ScrollView>
         </View>
@@ -442,6 +666,117 @@ export default function RecordScreen() {
           <Text style={styles.uploadButtonText}>📁 Upload Video</Text>
         </TouchableOpacity>
       </ScrollView>
+
+      {/* Shot Detail Modal */}
+      <Modal
+        visible={modalVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={closeShotModal}
+      >
+        <View style={styles.modalOverlay}>
+          {/* Backdrop - tap to close */}
+          <TouchableOpacity
+            style={StyleSheet.absoluteFill}
+            activeOpacity={1}
+            onPress={closeShotModal}
+          />
+
+          {/* Modal Content */}
+          {selectedShot && (
+            <View style={styles.modalContent}>
+              {/* Close Button */}
+              <TouchableOpacity style={styles.modalCloseButton} onPress={closeShotModal}>
+                <Text style={styles.modalCloseText}>✕</Text>
+              </TouchableOpacity>
+
+              <ScrollView
+                contentContainerStyle={styles.modalScrollContent}
+                showsVerticalScrollIndicator={true}
+              >
+                {/* Full Size Image */}
+                <Image
+                  source={{ uri: `data:image/jpeg;base64,${selectedShot.thumbnail}` }}
+                  style={styles.modalImage}
+                  resizeMode="contain"
+                />
+
+                {/* Shot Header */}
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle}>Shot {selectedShot.shot_number}</Text>
+                  <View style={styles.modalBadges}>
+                    {selectedShot.camera_angle && (
+                      <View style={styles.modalAngleBadge}>
+                        <Text style={styles.modalAngleText}>
+                          {selectedShot.camera_angle.toUpperCase()}
+                        </Text>
+                      </View>
+                    )}
+                    <View
+                      style={[
+                        styles.modalResultBadge,
+                        selectedShot.made === true ? styles.modalBadgeMade :
+                        selectedShot.made === false ? styles.modalBadgeMissed :
+                        styles.modalBadgeUnknown,
+                      ]}
+                    >
+                      <Text style={styles.modalResultText}>
+                        {selectedShot.made === true ? 'MADE' :
+                         selectedShot.made === false ? 'MISSED' : 'N/A'}
+                      </Text>
+                    </View>
+                  </View>
+                </View>
+
+                {/* Form Rating */}
+                {selectedShot.form_rating && (
+                  <View style={styles.modalRatingContainer}>
+                    <Text style={styles.modalRatingLabel}>Form Rating</Text>
+                    <View style={styles.modalRatingBar}>
+                      <View
+                        style={[
+                          styles.modalRatingFill,
+                          { width: `${selectedShot.form_rating * 10}%` },
+                          selectedShot.form_rating >= 7
+                            ? styles.ratingGood
+                            : selectedShot.form_rating >= 5
+                            ? styles.ratingOkay
+                            : styles.ratingPoor,
+                        ]}
+                      />
+                    </View>
+                    <Text style={styles.modalRatingValue}>{selectedShot.form_rating}/10</Text>
+                  </View>
+                )}
+
+                {/* Key Issue */}
+                {selectedShot.key_issue && selectedShot.key_issue !== 'none' && (
+                  <View style={styles.modalIssueCard}>
+                    <Text style={styles.modalIssueLabel}>Area to Fix</Text>
+                    <Text style={styles.modalIssueText}>{selectedShot.key_issue}</Text>
+                  </View>
+                )}
+
+                {/* Quick Cue */}
+                {selectedShot.quick_cue && (
+                  <View style={styles.modalCueCard}>
+                    <Text style={styles.modalCueLabel}>Quick Cue</Text>
+                    <Text style={styles.modalCueText}>"{selectedShot.quick_cue}"</Text>
+                  </View>
+                )}
+
+                {/* Feedback */}
+                {selectedShot.feedback && (
+                  <View style={styles.modalFeedbackCard}>
+                    <Text style={styles.modalFeedbackLabel}>Coach Feedback</Text>
+                    <Text style={styles.modalFeedbackText}>{selectedShot.feedback}</Text>
+                  </View>
+                )}
+              </ScrollView>
+            </View>
+          )}
+        </View>
+      </Modal>
       </SafeAreaView>
     );
   }
@@ -463,69 +798,113 @@ export default function RecordScreen() {
   }
 
   // ============================================================================
-  // Render: Welcome Screen
+  // Render: Record Screen (Camera-Centric Design)
   // ============================================================================
-  
-  return (
-    <View style={styles.container}>
-      <View style={styles.welcomeContainer}>
-        <Text style={styles.title}>🏀 FormCheck</Text>
-        <Text style={styles.subtitle}>AI Basketball Coach</Text>
 
-        <View style={styles.infoBox}>
-          <Text style={styles.infoTitle}>New: Multi-Shot Analysis</Text>
-          <Text style={styles.infoText}>• Record multiple shots in one video</Text>
-          <Text style={styles.infoText}>• Get analysis for each shot</Text>
-          <Text style={styles.infoText}>• Session summary with drills</Text>
+  return (
+    <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
+      <ScrollView
+        style={styles.recordScrollView}
+        contentContainerStyle={styles.recordScrollContent}
+        showsVerticalScrollIndicator={false}
+      >
+        {/* Header */}
+        <View style={styles.recordHeader}>
+          <Text style={styles.recordHeaderTitle}>Record Session</Text>
+          <Text style={styles.recordHeaderSubtitle}>Analyze your shooting form</Text>
         </View>
 
-        <View style={styles.toggleContainer}>
-          <Text style={styles.toggleLabel}>Shooting Hand:</Text>
-          <View style={styles.toggleButtons}>
+        {/* Camera Viewfinder Area */}
+        <View style={styles.viewfinderContainer}>
+          {/* Viewfinder Frame */}
+          <View style={styles.viewfinder}>
+            {/* Corner Brackets */}
+            <View style={[styles.cornerBracket, styles.cornerTopLeft]} />
+            <View style={[styles.cornerBracket, styles.cornerTopRight]} />
+            <View style={[styles.cornerBracket, styles.cornerBottomLeft]} />
+            <View style={[styles.cornerBracket, styles.cornerBottomRight]} />
+
+            {/* Center Target */}
+            <View style={styles.targetContainer}>
+              <View style={styles.targetRing}>
+                <View style={styles.targetCenter} />
+              </View>
+              <Text style={styles.targetText}>Position yourself in frame</Text>
+            </View>
+          </View>
+
+          {/* Recording Tips */}
+          <View style={styles.tipsBanner}>
+            <Text style={styles.tipsBannerText}>Full body visible  |  Good lighting  |  Stable camera</Text>
+          </View>
+        </View>
+
+        {/* Shooting Hand Toggle */}
+        <View style={styles.handToggleContainer}>
+          <Text style={styles.handToggleLabel}>Shooting Hand</Text>
+          <View style={styles.handToggleButtons}>
             <TouchableOpacity
               style={[
-                styles.toggleButton,
-                shootingSide === 'left' && styles.toggleButtonActive,
+                styles.handToggleButton,
+                shootingSide === 'left' && styles.handToggleButtonActive,
               ]}
               onPress={() => setShootingSide('left')}
             >
               <Text
                 style={[
-                  styles.toggleButtonText,
-                  shootingSide === 'left' && styles.toggleButtonTextActive,
+                  styles.handToggleText,
+                  shootingSide === 'left' && styles.handToggleTextActive,
                 ]}
               >
-                Left
+                LEFT
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={[
-                styles.toggleButton,
-                shootingSide === 'right' && styles.toggleButtonActive,
+                styles.handToggleButton,
+                shootingSide === 'right' && styles.handToggleButtonActive,
               ]}
               onPress={() => setShootingSide('right')}
             >
               <Text
                 style={[
-                  styles.toggleButtonText,
-                  shootingSide === 'right' && styles.toggleButtonTextActive,
+                  styles.handToggleText,
+                  shootingSide === 'right' && styles.handToggleTextActive,
                 ]}
               >
-                Right
+                RIGHT
               </Text>
             </TouchableOpacity>
           </View>
         </View>
 
-        <TouchableOpacity style={styles.startButton} onPress={startNewRecording}>
-          <Text style={styles.startButtonText}>📹 Start Recording</Text>
+        {/* Main Record Button */}
+        <TouchableOpacity style={styles.mainRecordButton} onPress={startNewRecording}>
+          <View style={styles.recordButtonOuter}>
+            <View style={styles.recordButtonInner}>
+              <View style={styles.recordButtonCenter} />
+            </View>
+          </View>
+          <Text style={styles.mainRecordText}>TAP TO RECORD</Text>
         </TouchableOpacity>
 
-        <TouchableOpacity style={styles.uploadButtonMain} onPress={startVideoUpload}>
-          <Text style={styles.uploadButtonMainText}>📁 Upload Video</Text>
+        {/* Upload Option */}
+        <TouchableOpacity style={styles.uploadOption} onPress={startVideoUpload}>
+          <View style={styles.uploadIconContainer}>
+            <Text style={styles.uploadIcon}>📁</Text>
+          </View>
+          <Text style={styles.uploadOptionText}>Upload existing video</Text>
         </TouchableOpacity>
-      </View>
-    </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+export default function RecordScreenWithBoundary() {
+  return (
+    <ErrorBoundary>
+      <RecordScreen />
+    </ErrorBoundary>
   );
 }
 
@@ -548,105 +927,210 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000',
   },
-  welcomeContainer: {
+  // ============================================================================
+  // Record Screen (Camera-Centric) Styles
+  // ============================================================================
+  recordScrollView: {
     flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 20,
-    width: '100%',
+    backgroundColor: '#000',
   },
-  title: {
-    fontSize: 48,
-    fontWeight: 'bold',
-    color: '#ff6b00',
-    marginBottom: 5,
-  },
-  subtitle: {
-    fontSize: 18,
-    color: '#fff',
-    marginBottom: 30,
-  },
-  infoBox: {
-    backgroundColor: 'rgba(255, 107, 0, 0.1)',
-    padding: 20,
-    borderRadius: 10,
-    width: '100%',
-    marginBottom: 30,
-    borderWidth: 1,
-    borderColor: '#ff6b00',
-  },
-  infoTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    color: '#ff6b00',
-    marginBottom: 10,
-  },
-  infoText: {
-    fontSize: 14,
-    color: '#ddd',
-    marginBottom: 5,
-  },
-  toggleContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 30,
-    gap: 15,
-  },
-  toggleLabel: {
-    fontSize: 16,
-    color: '#fff',
-  },
-  toggleButtons: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  toggleButton: {
-    paddingVertical: 8,
+  recordScrollContent: {
     paddingHorizontal: 20,
-    borderRadius: 20,
-    backgroundColor: 'rgba(255, 255, 255, 0.1)',
-    borderWidth: 2,
-    borderColor: 'rgba(255, 255, 255, 0.2)',
+    paddingTop: 10,
+    paddingBottom: 40,
   },
-  toggleButtonActive: {
-    backgroundColor: '#ff6b00',
-    borderColor: '#ff6b00',
-  },
-  toggleButtonText: {
-    fontSize: 14,
-    color: '#fff',
-  },
-  toggleButtonTextActive: {
-    fontWeight: 'bold',
-  },
-  startButton: {
-    backgroundColor: '#ff6b00',
-    paddingVertical: 15,
-    paddingHorizontal: 40,
-    borderRadius: 30,
-    width: '100%',
+  recordHeader: {
     alignItems: 'center',
     marginBottom: 15,
   },
-  startButtonText: {
-    fontSize: 18,
+  recordHeaderTitle: {
+    fontSize: 24,
     fontWeight: 'bold',
-    color: '#fff',
+    color: '#FF4D00',
   },
-  uploadButtonMain: {
-    backgroundColor: 'rgba(255, 255, 255, 0.1)',
-    paddingVertical: 15,
-    paddingHorizontal: 40,
-    borderRadius: 30,
-    borderWidth: 2,
-    borderColor: '#ff6b00',
+  recordHeaderSubtitle: {
+    fontSize: 14,
+    color: '#888',
+    marginTop: 4,
+  },
+  viewfinderContainer: {
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  viewfinder: {
     width: '100%',
+    aspectRatio: 4 / 3,
+    backgroundColor: '#0a0a0a',
+    borderRadius: 20,
+    borderWidth: 2,
+    borderColor: '#333',
+    justifyContent: 'center',
+    alignItems: 'center',
+    overflow: 'hidden',
+    position: 'relative',
+  },
+  cornerBracket: {
+    position: 'absolute',
+    width: 40,
+    height: 40,
+    borderColor: '#FF4D00',
+  },
+  cornerTopLeft: {
+    top: 15,
+    left: 15,
+    borderTopWidth: 3,
+    borderLeftWidth: 3,
+    borderTopLeftRadius: 8,
+  },
+  cornerTopRight: {
+    top: 15,
+    right: 15,
+    borderTopWidth: 3,
+    borderRightWidth: 3,
+    borderTopRightRadius: 8,
+  },
+  cornerBottomLeft: {
+    bottom: 15,
+    left: 15,
+    borderBottomWidth: 3,
+    borderLeftWidth: 3,
+    borderBottomLeftRadius: 8,
+  },
+  cornerBottomRight: {
+    bottom: 15,
+    right: 15,
+    borderBottomWidth: 3,
+    borderRightWidth: 3,
+    borderBottomRightRadius: 8,
+  },
+  targetContainer: {
     alignItems: 'center',
   },
-  uploadButtonMainText: {
-    fontSize: 18,
+  targetRing: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    borderWidth: 2,
+    borderColor: 'rgba(255, 77, 0, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  targetCenter: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#FF4D00',
+  },
+  targetText: {
+    marginTop: 12,
+    fontSize: 14,
+    color: '#666',
+    fontWeight: '500',
+  },
+  tipsBanner: {
+    marginTop: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    backgroundColor: 'rgba(255, 77, 0, 0.1)',
+    borderRadius: 20,
+  },
+  tipsBannerText: {
+    fontSize: 11,
+    color: '#888',
+    textAlign: 'center',
+  },
+  handToggleContainer: {
+    alignItems: 'center',
+    marginBottom: 25,
+  },
+  handToggleLabel: {
+    fontSize: 13,
+    color: '#666',
+    marginBottom: 10,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+  },
+  handToggleButtons: {
+    flexDirection: 'row',
+    backgroundColor: '#1a1a1a',
+    borderRadius: 25,
+    padding: 4,
+  },
+  handToggleButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 30,
+    borderRadius: 20,
+  },
+  handToggleButtonActive: {
+    backgroundColor: '#FF4D00',
+  },
+  handToggleText: {
+    fontSize: 13,
+    color: '#666',
+    fontWeight: '600',
+    letterSpacing: 1,
+  },
+  handToggleTextActive: {
+    color: '#fff',
+  },
+  mainRecordButton: {
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  recordButtonOuter: {
+    width: 90,
+    height: 90,
+    borderRadius: 45,
+    borderWidth: 4,
+    borderColor: '#FF4D00',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  recordButtonInner: {
+    width: 74,
+    height: 74,
+    borderRadius: 37,
+    backgroundColor: 'rgba(255, 77, 0, 0.1)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  recordButtonCenter: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: '#FF4D00',
+  },
+  mainRecordText: {
+    fontSize: 14,
+    color: '#FF4D00',
     fontWeight: 'bold',
-    color: '#ff6b00',
+    letterSpacing: 2,
+  },
+  uploadOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+  },
+  uploadIconContainer: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    borderWidth: 2,
+    borderColor: '#444',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 10,
+  },
+  uploadIcon: {
+    fontSize: 16,
+    color: '#666',
+    fontWeight: 'bold',
+  },
+  uploadOptionText: {
+    fontSize: 14,
+    color: '#666',
   },
   videoPreviewContainer: {
     width: '90%',
@@ -804,6 +1288,9 @@ const styles = StyleSheet.create({
   shotBadgeMissed: {
     backgroundColor: '#ff0000',
   },
+  shotBadgeUnknown: {
+    backgroundColor: '#888',
+  },
   shotBadgeText: {
     color: '#000',
     fontSize: 14,
@@ -813,6 +1300,13 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#aaa',
     marginTop: 5,
+  },
+  shotAngleLabel: {
+    fontSize: 9,
+    color: '#888',
+    fontWeight: '600',
+    letterSpacing: 0.5,
+    marginTop: 2,
   },
   shotRating: {
     fontSize: 11,
@@ -933,5 +1427,254 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: 'bold',
     color: '#fff',
+  },
+  // Modal styles
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.9)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalContent: {
+    width: Dimensions.get('window').width * 0.92,
+    maxHeight: Dimensions.get('window').height * 0.85,
+    backgroundColor: '#1a1a1a',
+    borderRadius: 20,
+    overflow: 'hidden',
+  },
+  modalScrollContent: {
+    padding: 20,
+    paddingBottom: 40,
+  },
+  modalCloseButton: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 10,
+  },
+  modalCloseText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  modalImage: {
+    width: '100%',
+    height: 350,
+    borderRadius: 12,
+    backgroundColor: '#222',
+    marginBottom: 20,
+    marginTop: 30,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  modalBadges: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  modalAngleBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 12,
+    backgroundColor: '#333',
+    borderWidth: 1,
+    borderColor: '#555',
+  },
+  modalAngleText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#aaa',
+    letterSpacing: 0.5,
+  },
+  modalTitle: {
+    fontSize: 28,
+    fontWeight: 'bold',
+    color: '#fff',
+  },
+  modalResultBadge: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+  },
+  modalBadgeMade: {
+    backgroundColor: '#00cc00',
+  },
+  modalBadgeMissed: {
+    backgroundColor: '#cc0000',
+  },
+  modalBadgeUnknown: {
+    backgroundColor: '#666',
+  },
+  modalResultText: {
+    color: '#fff',
+    fontWeight: 'bold',
+    fontSize: 14,
+  },
+  modalRatingContainer: {
+    marginBottom: 20,
+  },
+  modalRatingLabel: {
+    fontSize: 14,
+    color: '#aaa',
+    marginBottom: 8,
+  },
+  modalRatingBar: {
+    height: 8,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    borderRadius: 4,
+    overflow: 'hidden',
+    marginBottom: 8,
+  },
+  modalRatingFill: {
+    height: '100%',
+    borderRadius: 4,
+  },
+  ratingGood: {
+    backgroundColor: '#00cc00',
+  },
+  ratingOkay: {
+    backgroundColor: '#ff6b00',
+  },
+  ratingPoor: {
+    backgroundColor: '#cc0000',
+  },
+  modalRatingValue: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#ff6b00',
+    textAlign: 'right',
+  },
+  modalDetailRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  modalDetailLabel: {
+    fontSize: 14,
+    color: '#aaa',
+  },
+  modalDetailValue: {
+    fontSize: 14,
+    color: '#fff',
+    fontWeight: '600',
+  },
+  modalMetricsCard: {
+    backgroundColor: 'rgba(255, 107, 0, 0.1)',
+    padding: 15,
+    borderRadius: 12,
+    marginBottom: 15,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 107, 0, 0.3)',
+  },
+  modalMetricsTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#ff6b00',
+    marginBottom: 12,
+  },
+  modalMetricRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  modalMetricLabel: {
+    fontSize: 14,
+    color: '#ddd',
+  },
+  modalMetricValue: {
+    fontSize: 14,
+    color: '#fff',
+    fontWeight: '600',
+  },
+  modalIssueCard: {
+    backgroundColor: 'rgba(255, 0, 0, 0.1)',
+    padding: 15,
+    borderRadius: 12,
+    marginBottom: 15,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 0, 0, 0.3)',
+  },
+  modalIssueLabel: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#ff6666',
+    marginBottom: 8,
+  },
+  modalIssueText: {
+    fontSize: 14,
+    color: '#fff',
+    lineHeight: 20,
+  },
+  modalCueCard: {
+    backgroundColor: 'rgba(0, 200, 0, 0.1)',
+    padding: 15,
+    borderRadius: 12,
+    marginBottom: 15,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 200, 0, 0.3)',
+  },
+  modalCueLabel: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#00cc00',
+    marginBottom: 8,
+  },
+  modalCueText: {
+    fontSize: 18,
+    color: '#fff',
+    fontStyle: 'italic',
+    lineHeight: 24,
+  },
+  modalFeedbackCard: {
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    padding: 15,
+    borderRadius: 12,
+    marginBottom: 15,
+  },
+  modalFeedbackLabel: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#aaa',
+    marginBottom: 8,
+  },
+  modalFeedbackText: {
+    fontSize: 14,
+    color: '#fff',
+    lineHeight: 22,
+  },
+  // Shots card subtitle and expand indicator
+  shotsSubtitle: {
+    fontSize: 12,
+    color: '#666',
+    marginBottom: 10,
+  },
+  expandIndicator: {
+    position: 'absolute',
+    bottom: 45,
+    right: 5,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: 'rgba(255, 107, 0, 0.9)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  expandIndicatorText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: 'bold',
   },
 });

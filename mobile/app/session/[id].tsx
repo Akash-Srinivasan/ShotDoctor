@@ -20,8 +20,9 @@ import { Ionicons } from '@expo/vector-icons';
 import { db, type Session, type Shot } from '../../lib/supabase';
 import { useFingerprint } from '../../contexts/FingerprintContext';
 import { compareShotToSignature, getTopDeviations, type MetricDeviation } from '../../lib/fingerprint-utils';
+import { ErrorBoundary } from '../../components/ErrorBoundary';
 
-export default function SessionDetailScreen() {
+function SessionDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
   const [session, setSession] = useState<Session | null>(null);
@@ -215,6 +216,14 @@ export default function SessionDetailScreen() {
         )}
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+export default function SessionDetailWithBoundary() {
+  return (
+    <ErrorBoundary>
+      <SessionDetailScreen />
+    </ErrorBoundary>
   );
 }
 

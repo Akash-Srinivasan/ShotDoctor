@@ -13,18 +13,24 @@ import {
   ActivityIndicator,
   RefreshControl,
   Alert,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../contexts/AuthContext';
+import { useFingerprint } from '../../contexts/FingerprintContext';
+import { ErrorBoundary } from '../../components/ErrorBoundary';
+import { generateSessionInsight } from '../../lib/fingerprint-utils';
+import { type ShotFingerprint } from '../../lib/api';
 import { db, type Session } from '../../lib/supabase';
 
 type SortOption = 'recent' | 'accuracy' | 'shots';
 
-export default function HistoryScreen() {
+function HistoryScreen() {
   const router = useRouter();
   const { user } = useAuth();
+  const { fingerprint } = useFingerprint();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -168,7 +174,7 @@ export default function HistoryScreen() {
             </View>
           ) : (
             displayedSessions.map((session) => (
-              <SessionCard key={session.id} session={session} />
+              <SessionCard key={session.id} session={session} fingerprint={fingerprint} />
             ))
           )}
         </ScrollView>
@@ -177,8 +183,17 @@ export default function HistoryScreen() {
   );
 }
 
+export default function HistoryScreenWithBoundary() {
+  return (
+    <ErrorBoundary>
+      <HistoryScreen />
+    </ErrorBoundary>
+  );
+}
+
 // Session Card Component
-function SessionCard({ session }: { session: Session }) {
+function SessionCard({ session, fingerprint }: { session: Session & { id: string }; fingerprint: ShotFingerprint | null }) {
+  const router = useRouter();
   const date = new Date(session.started_at);
   const formattedDate = date.toLocaleDateString('en-US', {
     month: 'short',
@@ -191,18 +206,46 @@ function SessionCard({ session }: { session: Session }) {
 
   const accuracy = session.shooting_percentage;
 
+  // Determine accuracy color based on percentage
+  const getAccuracyColor = (acc: number) => {
+    if (acc >= 70) return '#10B981'; // Green
+    if (acc >= 50) return '#F59E0B'; // Amber
+    return '#EF4444'; // Red
+  };
+
+  const getAccuracyLabel = (acc: number) => {
+    if (acc >= 70) return 'Great';
+    if (acc >= 50) return 'Good';
+    return 'Fair';
+  };
+
+  const accuracyColor = getAccuracyColor(accuracy);
+  const insight = generateSessionInsight(session, fingerprint);
+
   return (
-    <TouchableOpacity style={styles.sessionCard} activeOpacity={0.8}>
+    <TouchableOpacity style={styles.sessionCard} activeOpacity={0.8} onPress={() => router.push(`/session/${session.id}`)}>
       <View style={styles.sessionHeader}>
-        <View>
+        {/* Thumbnail placeholder */}
+        <View style={styles.thumbnailContainer}>
+          <Ionicons name="basketball-outline" size={28} color="#FF4D00" />
+        </View>
+
+        <View style={styles.sessionInfo}>
           <Text style={styles.sessionDate}>{formattedDate}</Text>
           <Text style={styles.sessionTime}>{formattedTime}</Text>
         </View>
-        
-        {/* Accuracy Circle */}
-        <View style={styles.accuracyContainer}>
-          <Text style={styles.accuracyNumber}>{accuracy.toFixed(0)}</Text>
-          <Text style={styles.accuracyPercent}>%</Text>
+
+        {/* Enhanced Accuracy Display with Color Ring + Badge */}
+        <View style={styles.accuracyWrapper}>
+          <View style={[styles.accuracyRing, { borderColor: accuracyColor }]}>
+            <View style={styles.accuracyInner}>
+              <Text style={styles.accuracyNumber}>{accuracy.toFixed(0)}</Text>
+              <Text style={styles.accuracyPercent}>%</Text>
+            </View>
+          </View>
+          <View style={[styles.accuracyBadge, { backgroundColor: accuracyColor }]}>
+            <Text style={styles.accuracyBadgeText}>{getAccuracyLabel(accuracy)}</Text>
+          </View>
         </View>
       </View>
 
@@ -213,16 +256,16 @@ function SessionCard({ session }: { session: Session }) {
           <Text style={styles.sessionStatValue}>{session.shot_count}</Text>
           <Text style={styles.sessionStatLabel}>Shots</Text>
         </View>
-        
+
         <View style={styles.sessionStatDivider} />
-        
+
         <View style={styles.sessionStat}>
           <Text style={styles.sessionStatValue}>{session.make_count}</Text>
           <Text style={styles.sessionStatLabel}>Made</Text>
         </View>
-        
+
         <View style={styles.sessionStatDivider} />
-        
+
         <View style={styles.sessionStat}>
           <Text style={styles.sessionStatValue}>
             {session.average_form_rating ? session.average_form_rating.toFixed(1) : '--'}
@@ -230,6 +273,13 @@ function SessionCard({ session }: { session: Session }) {
           <Text style={styles.sessionStatLabel}>Form</Text>
         </View>
       </View>
+
+      {insight && (
+        <View style={styles.sessionInsight}>
+          <Ionicons name="bulb-outline" size={14} color="#FF4D00" />
+          <Text style={styles.sessionInsightText}>{insight}</Text>
+        </View>
+      )}
     </TouchableOpacity>
   );
 }
@@ -273,8 +323,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#121212',
     borderRadius: 12,
     padding: 20,
-    borderWidth: 1,
-    borderColor: '#1E1E1E',
+    borderWidth: 2,
+    borderColor: '#FF4D00',
   },
   summaryCard: {
     flex: 1,
@@ -336,20 +386,45 @@ const styles = StyleSheet.create({
     paddingTop: 0,
   },
   
-  // Session Card
+  // Session Card - Enhanced with better borders and shadows
   sessionCard: {
     backgroundColor: '#121212',
-    borderRadius: 12,
+    borderRadius: 16,
     padding: 20,
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: '#1E1E1E',
+    marginBottom: 16,
+    borderWidth: 2.5,
+    borderColor: '#444',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.3,
+        shadowRadius: 8,
+      },
+      android: {
+        elevation: 6,
+      },
+    }),
   },
   sessionHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 16,
+  },
+  thumbnailContainer: {
+    width: 56,
+    height: 56,
+    borderRadius: 12,
+    backgroundColor: '#1A1A1A',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#2A2A2A',
+    marginRight: 12,
+  },
+  sessionInfo: {
+    flex: 1,
   },
   sessionDate: {
     fontSize: 17,
@@ -362,29 +437,62 @@ const styles = StyleSheet.create({
     color: '#666',
   },
   
-  // Accuracy Circle
-  accuracyContainer: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    backgroundColor: '#1E1E1E',
+  // Enhanced Accuracy Display
+  accuracyWrapper: {
+    alignItems: 'center',
+  },
+  accuracyRing: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: '#1A1A1A',
     alignItems: 'center',
     justifyContent: 'center',
+    borderWidth: 3,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.2,
+        shadowRadius: 4,
+      },
+      android: {
+        elevation: 3,
+      },
+    }),
+  },
+  accuracyInner: {
     flexDirection: 'row',
-    borderWidth: 2,
-    borderColor: '#FF4D00',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   accuracyNumber: {
-    fontSize: 20,
-    fontWeight: '700',
+    fontSize: 22,
+    fontWeight: '800',
     color: '#FFF',
     letterSpacing: -0.5,
   },
   accuracyPercent: {
     fontSize: 11,
     fontWeight: '700',
-    color: '#666',
+    color: '#888',
     marginLeft: 2,
+    marginTop: 2,
+  },
+  accuracyBadge: {
+    marginTop: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 10,
+    minWidth: 50,
+    alignItems: 'center',
+  },
+  accuracyBadgeText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#FFF',
+    letterSpacing: 0.5,
+    textTransform: 'uppercase',
   },
   
   // Session Stats
@@ -419,6 +527,23 @@ const styles = StyleSheet.create({
     marginHorizontal: 16,
   },
   
+  // Session Insight
+  sessionInsight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 12,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#1E1E1E',
+  },
+  sessionInsightText: {
+    flex: 1,
+    fontSize: 13,
+    color: '#FF4D00',
+    fontWeight: '600',
+  },
+
   // Empty State
   emptyState: {
     alignItems: 'center',

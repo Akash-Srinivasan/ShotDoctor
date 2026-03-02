@@ -7,6 +7,8 @@ import { useEffect } from 'react';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { AuthProvider } from '../contexts/AuthContext';
+import { FingerprintProvider } from '../contexts/FingerprintContext';
+import { ErrorBoundary } from '../components/ErrorBoundary';
 import * as SplashScreen from 'expo-splash-screen';
 
 // Prevent splash screen from auto-hiding
@@ -23,7 +25,9 @@ export default function RootLayout() {
   }, []);
 
   return (
+    <ErrorBoundary>
     <AuthProvider>
+      <FingerprintProvider>
       <StatusBar style="light" />
       <Stack
         screenOptions={{
@@ -83,16 +87,25 @@ export default function RootLayout() {
             gestureEnabled: false, // Prevent back gesture during onboarding
           }}
         />
-        
-        {/* Main app screens */}
+
+        {/* Edit Preferences */}
         <Stack.Screen
-          name="record"
+          name="edit-preferences"
           options={{
-            title: 'Record Shot',
+            title: 'Edit Preferences',
             headerShown: false,
+            presentation: 'modal',
           }}
         />
         
+        {/* Session Detail */}
+        <Stack.Screen
+          name="session/[id]"
+          options={{
+            headerShown: false,
+          }}
+        />
+
         {/* Tab navigator */}
         <Stack.Screen
           name="(tabs)"
@@ -101,6 +114,8 @@ export default function RootLayout() {
           }}
         />
       </Stack>
+      </FingerprintProvider>
     </AuthProvider>
+    </ErrorBoundary>
   );
 }

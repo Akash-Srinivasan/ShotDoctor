@@ -47,6 +47,7 @@ export interface SessionSummary {
   session_feedback: string;
   drill_suggestions: string[];
   shots: ShotAnalysis[];
+  server_persisted?: boolean;
 }
 
 export interface HealthResponse {

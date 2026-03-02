@@ -31,11 +31,14 @@ ShotAnalysis (JSON)       -->  sent to mobile app
 |------|------|
 | `api/core/live_analysis.py` | PoseDetector, LiveShotDetector, ShotEvent, detect_camera_angle |
 | `api/core/biomechanics.py` | OptimalRange constants, research-backed reference values |
-| `api/main.py` | FastAPI endpoint, Gemini prompt construction, ShotAnalysis model |
+| `api/main.py` | FastAPI endpoint, Gemini prompts, ShotAnalysis model, **server-side Supabase persistence** |
+| `api/core/ball_tracker.py` | YOLO ball detection, CustomBallTracker, trajectory tracking |
+| `api/core/rim_detector.py` | Rim position detection utilities |
 | `mobile/lib/api.ts` | TypeScript ShotAnalysis interface, API client |
-| `mobile/lib/supabase.ts` | Shot/Session DB types, createShots/createSession |
-| `mobile/app/(tabs)/record.tsx` | Video recording, upload, saves results to Supabase |
+| `mobile/lib/supabase.ts` | Shot/Session DB types, createShots/createSession (fallback) |
+| `mobile/app/(tabs)/record.tsx` | Video recording, upload, results display |
 | `mobile/app/session/[id].tsx` | Session detail view, ShotCard with angle badge + metrics |
+| `mobile/components/ErrorBoundary.tsx` | Crash recovery — wraps every screen for beta resilience |
 | `api/core/test_camera_angle.py` | CLI test script for angle detection (`--shots` mode) |
 
 ---
@@ -313,14 +316,16 @@ camera_angle, thumbnail (base64), timestamp
 ```
 
 ### Shot (Supabase table)
-Persisted to `shots` table via `db.createShots()`. Same fields as ShotAnalysis but with:
+Persisted to `shots` table. Same fields as ShotAnalysis but with:
 - `thumbnail_url` instead of `thumbnail` (uploaded to Supabase storage)
 - `camera_angle` column (TEXT, nullable)
 - `session_id` and `user_id` foreign keys
 - All 11 metric columns (REAL DEFAULT 0.0)
 
+**Primary write path**: API server writes directly using `supabase-py` with `service_role` key after analysis completes. Mobile client only writes as a fallback if `server_persisted` is false.
+
 ### Session (Supabase table)
-Created before analysis, updated after. Contains aggregate stats (shot_count, make_count, shooting_percentage, etc.) and session-level Gemini feedback.
+Created by mobile client before analysis (placeholder), updated by API server after analysis with final stats (shot_count, make_count, shooting_percentage, etc.) and session-level Gemini feedback.
 
 ---
 

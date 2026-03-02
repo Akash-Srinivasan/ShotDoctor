@@ -293,60 +293,74 @@ function RecordScreen() {
       // Save results to database
       if (user && newSessionId) {
         try {
-          // Update session with results
-          await db.updateSession(newSessionId, {
-            ended_at: new Date().toISOString(),
-            shot_count: analysis.total_shots,
-            make_count: analysis.shots_made,
-            miss_count: analysis.shots_missed,
-            shooting_percentage: analysis.shooting_percentage,
-            average_form_rating: analysis.average_form_rating,
-            session_feedback: analysis.session_feedback,
-            drill_suggestions: analysis.drill_suggestions,
-          });
-
-          // Upload thumbnails and create shot records
-          const shotRecords = await Promise.all(
-            analysis.shots.map(async (shot) => {
-              let thumbnailUrl: string | null = null;
+          if (analysis.server_persisted) {
+            // Server already wrote session + shots — just upload thumbnails
+            console.log('✓ Server persisted results — skipping client DB writes');
+            for (const shot of analysis.shots) {
               if (shot.thumbnail) {
                 try {
-                  thumbnailUrl = await db.uploadThumbnail(
-                    newSessionId!,
-                    shot.shot_number,
-                    shot.thumbnail
-                  );
+                  await db.uploadThumbnail(newSessionId!, shot.shot_number, shot.thumbnail);
                 } catch (thumbErr) {
                   console.warn(`Thumbnail upload failed for shot ${shot.shot_number}:`, thumbErr);
                 }
               }
-              return {
-                session_id: newSessionId!,
-                shot_number: shot.shot_number,
-                made: shot.made,
-                miss_type: shot.miss_type,
-                elbow_angle_load: shot.elbow_angle_load,
-                elbow_angle_release: shot.elbow_angle_release,
-                wrist_height_release: shot.wrist_height_release,
-                knee_bend_load: shot.knee_bend_load,
-                hip_angle_load: shot.hip_angle_load,
-                elbow_height_load: shot.elbow_height_load,
-                heel_height_release: shot.heel_height_release,
-                trunk_lean_release: shot.trunk_lean_release,
-                stance_width: shot.stance_width,
-                shoulder_level_diff: shot.shoulder_level_diff,
-                elbow_lateral_offset: shot.elbow_lateral_offset,
-                form_rating: shot.form_rating,
-                feedback: shot.feedback,
-                key_issue: shot.key_issue,
-                quick_cue: shot.quick_cue,
-                camera_angle: shot.camera_angle,
-                thumbnail_url: thumbnailUrl,
-              };
-            })
-          );
+            }
+          } else {
+            // Fallback: server didn't persist, write everything client-side
+            console.log('⚠️ Server did not persist — writing client-side');
+            await db.updateSession(newSessionId, {
+              ended_at: new Date().toISOString(),
+              shot_count: analysis.total_shots,
+              make_count: analysis.shots_made,
+              miss_count: analysis.shots_missed,
+              shooting_percentage: analysis.shooting_percentage,
+              average_form_rating: analysis.average_form_rating,
+              session_feedback: analysis.session_feedback,
+              drill_suggestions: analysis.drill_suggestions,
+            });
 
-          await db.createShots(shotRecords);
+            const shotRecords = await Promise.all(
+              analysis.shots.map(async (shot) => {
+                let thumbnailUrl: string | null = null;
+                if (shot.thumbnail) {
+                  try {
+                    thumbnailUrl = await db.uploadThumbnail(
+                      newSessionId!,
+                      shot.shot_number,
+                      shot.thumbnail
+                    );
+                  } catch (thumbErr) {
+                    console.warn(`Thumbnail upload failed for shot ${shot.shot_number}:`, thumbErr);
+                  }
+                }
+                return {
+                  session_id: newSessionId!,
+                  shot_number: shot.shot_number,
+                  made: shot.made,
+                  miss_type: shot.miss_type,
+                  elbow_angle_load: shot.elbow_angle_load,
+                  elbow_angle_release: shot.elbow_angle_release,
+                  wrist_height_release: shot.wrist_height_release,
+                  knee_bend_load: shot.knee_bend_load,
+                  hip_angle_load: shot.hip_angle_load,
+                  elbow_height_load: shot.elbow_height_load,
+                  heel_height_release: shot.heel_height_release,
+                  trunk_lean_release: shot.trunk_lean_release,
+                  stance_width: shot.stance_width,
+                  shoulder_level_diff: shot.shoulder_level_diff,
+                  elbow_lateral_offset: shot.elbow_lateral_offset,
+                  form_rating: shot.form_rating,
+                  feedback: shot.feedback,
+                  key_issue: shot.key_issue,
+                  quick_cue: shot.quick_cue,
+                  camera_angle: shot.camera_angle,
+                  thumbnail_url: thumbnailUrl,
+                };
+              })
+            );
+
+            await db.createShots(shotRecords);
+          }
           console.log('💾 Session saved to database');
 
           // Refresh fingerprint in background so home screen shows updated data

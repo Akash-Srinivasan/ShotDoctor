@@ -24,12 +24,19 @@ analyzeVideoFile()
     |         |
     |         v
     |    POST /analyze ─────────> SessionSummary JSON
+    |         |
+    |         └──> [API-SIDE PERSISTENCE]
+    |              API writes results to Supabase server-side using
+    |              service_role key (supabase-py). This ensures data
+    |              is saved even if the mobile client times out.
+    |              - Updates session row with stats
+    |              - Batch inserts all shots with metrics
+    |              - Returns server_persisted: true in response
     |
-    ├──> db.updateSession()     (Supabase - fill in results)
+    ├──> IF server_persisted: skip client-side writes
+    |    ELSE (fallback): db.updateSession(), db.createShots()
     |
-    ├──> db.uploadThumbnail()   (Supabase Storage - per shot)
-    |
-    └──> db.createShots()       (Supabase - shot records)
+    ├──> db.uploadThumbnail()   (Supabase Storage - per shot, still client-side)
     |
     v
 Results View (inline in record.tsx)
@@ -37,6 +44,12 @@ Results View (inline in record.tsx)
     v
 Session Detail (session/[id].tsx via History tab)
 ```
+
+> **Note**: As of the API-side Supabase persistence migration, the API server
+> writes session/shot data directly using `supabase-py` with the `service_role`
+> key. The mobile client checks for `server_persisted: true` in the response and
+> skips its own database writes. This prevents data loss when the client's HTTP
+> connection times out during long video analysis.
 
 ---
 
@@ -50,6 +63,7 @@ Session Detail (session/[id].tsx via History tab)
 | `components/Camera.tsx` | Video recording with expo-camera |
 | `components/RimCalibrationOverlay.tsx` | Rim position selection UI |
 | `components/ShotMarkerTimeline.tsx` | Shot markers on video timeline |
+| `components/ErrorBoundary.tsx` | Crash recovery UI — wraps every screen and the root layout |
 | `lib/api.ts` | API client, types (ShotAnalysis, SessionSummary) |
 | `lib/supabase.ts` | Database client, types (Shot, Session, Profile) |
 | `contexts/AuthContext.tsx` | User/profile state |
@@ -160,58 +174,54 @@ const analysis = await analyzeVideoWithProgress(
   onProgress,    // Updates analysisProgress state
   rimPosition,   // null if not set
   undefined,     // playerId (unused)
-  sessionId      // For progress polling
+  sessionId,     // For progress polling
+  userContext     // Skill level, focus areas, user_id
 );
-// Returns: SessionSummary
+// Returns: SessionSummary (includes server_persisted flag)
 ```
 
-### 3. Update Session (after API returns)
+### 3. Server-Side Persistence (API writes directly)
+
+The API server writes results to Supabase using `supabase-py` with the
+`service_role` key immediately after analysis completes. This happens before
+the HTTP response is sent back to the mobile client, so data is safe even if
+the connection drops.
+
+The API response includes `server_persisted: true` when this succeeds.
+
+### 4. Client-Side Fallback (if server didn't persist)
 
 ```typescript
-await db.updateSession(sessionId, {
-  ended_at: new Date().toISOString(),
-  shot_count: analysis.total_shots,
-  make_count: analysis.shots_made,
-  miss_count: analysis.shots_missed,
-  shooting_percentage: analysis.shooting_percentage,
-  average_form_rating: analysis.average_form_rating,
-  session_feedback: analysis.session_feedback,
-  drill_suggestions: analysis.drill_suggestions,
-});
-```
+// Only runs if server_persisted is false/missing
+if (!analysis.server_persisted) {
+  await db.updateSession(sessionId, {
+    ended_at: new Date().toISOString(),
+    shot_count: analysis.total_shots,
+    make_count: analysis.shots_made,
+    miss_count: analysis.shots_missed,
+    shooting_percentage: analysis.shooting_percentage,
+    average_form_rating: analysis.average_form_rating,
+    session_feedback: analysis.session_feedback,
+    drill_suggestions: analysis.drill_suggestions,
+  });
 
-### 4. Upload Thumbnails + Create Shots
+  const shotRecords = await Promise.all(
+    analysis.shots.map(async (shot) => {
+      const thumbnailUrl = await db.uploadThumbnail(
+        sessionId, shot.shot_number, shot.thumbnail
+      );
+      return {
+        session_id: sessionId,
+        shot_number: shot.shot_number,
+        made: shot.made,
+        // ... all metric fields ...
+        thumbnail_url: thumbnailUrl,
+      };
+    })
+  );
 
-```typescript
-const shotRecords = await Promise.all(
-  analysis.shots.map(async (shot) => {
-    // Upload thumbnail to Supabase Storage
-    const thumbnailUrl = await db.uploadThumbnail(
-      sessionId,
-      shot.shot_number,
-      shot.thumbnail  // base64
-    );
-
-    return {
-      session_id: sessionId,
-      shot_number: shot.shot_number,
-      made: shot.made,
-      miss_type: shot.miss_type,
-      elbow_angle_load: shot.elbow_angle_load,
-      elbow_angle_release: shot.elbow_angle_release,
-      wrist_height_release: shot.wrist_height_release,
-      knee_bend_load: shot.knee_bend_load,
-      form_rating: shot.form_rating,
-      feedback: shot.feedback,
-      key_issue: shot.key_issue,
-      quick_cue: shot.quick_cue,
-      camera_angle: shot.camera_angle,
-      thumbnail_url: thumbnailUrl,
-    };
-  })
-);
-
-await db.createShots(shotRecords);
+  await db.createShots(shotRecords);
+}
 ```
 
 ---
@@ -352,6 +362,21 @@ useFocusEffect(
 ```
 
 This ensures "Start Recording" from Home always starts fresh.
+
+---
+
+## Error Boundaries
+
+Every screen is wrapped in `<ErrorBoundary>` (`components/ErrorBoundary.tsx`) so that an unhandled crash on one tab doesn't kill the entire app. The boundary catches React render errors and shows a dark-themed fallback UI with:
+- "Something went wrong" message
+- Error details (for beta bug reports)
+- **Try Again** button (resets error state, re-renders children)
+- **Go Home** button (navigates to tabs root)
+
+**Wrapping strategy:**
+- Root layout (`app/_layout.tsx`) — catches provider/navigation failures
+- Each tab screen — wrapped in the default export so tab navigation stays functional
+- Session detail (`app/session/[id].tsx`) — crash-prone due to computed metrics on nullable data
 
 ---
 

@@ -60,6 +60,10 @@ try:
         ELBOW_ANGLE_LOAD,
         ELBOW_ANGLE_RELEASE,
         RELEASE_HEIGHT,
+        HIP_ANGLE_LOAD,
+        ELBOW_HEIGHT_LOAD,
+        HEEL_HEIGHT_RELEASE,
+        TRUNK_LEAN_RELEASE,
     )
     BIOMECHANICS_AVAILABLE = True
 except ImportError:
@@ -119,6 +123,22 @@ class ShotEvent:
     did_well: Optional[List[str]] = None
     quick_cue: Optional[str] = None  # 2-4 word reminder
     looks_like: Optional[str] = None  # "makes" or "misses"
+    camera_angle: Optional[str] = None  # "side", "front", "angled"
+    camera_angle_confidence: Optional[float] = None
+    # New biomechanics metrics
+    hip_angle_load: float = 0.0        # Side-view (primary)
+    elbow_height_load: float = 0.0     # Side-view (primary)
+    heel_height_release: float = 0.0   # Side-view (primary)
+    trunk_lean_release: float = 0.0    # Side-view (primary)
+    stance_width: float = 0.0          # Front-view (supplementary)
+    shoulder_level_diff: float = 0.0   # Front-view (supplementary)
+    elbow_lateral_offset: float = 0.0  # Front-view (supplementary)
+    # Motion quality metrics
+    hitch_count: int = 0              # Number of velocity reversals in upward phase (0 = smooth)
+    hitch_severity: float = 0.0       # Max wrist drop during hitch, normalized to torso height
+    motion_smoothness: float = 1.0    # Path efficiency ratio (1.0 = perfect, higher = jerkier)
+    pocket_lateral_sweep: float = 0.0 # Max horizontal deviation from straight path, normalized to shoulder width
+    dip_depth: float = 0.0            # Lowest wrist Y below hip during load, normalized to torso height
     processing: bool = True
 
 @dataclass
@@ -850,6 +870,145 @@ class BallDetector:
 # Shot Detector
 # ============================================================================
 
+def detect_camera_angle(pose_detector: PoseDetector, cap, num_frames: int = 30) -> Tuple[str, float]:
+    """
+    Detect camera angle from first N frames of video.
+
+    Returns ('side'|'front'|'angled', confidence 0-1).
+
+    Algorithm:
+    - For each frame, calculate shoulder_spread = abs(left_shoulder.x - right_shoulder.x)
+    - Calculate torso_height using available shoulder/hip landmarks
+    - ratio = shoulder_spread / torso_height
+
+    Thresholds:
+    - ratio > 0.6  -> 'front' (shoulders appear wide = facing camera)
+    - ratio < 0.25 -> 'side' (shoulders appear narrow = perpendicular to camera)
+    - otherwise    -> 'angled'
+
+    Use median of ratios across frames for robustness.
+    Confidence = distance from nearest threshold boundary, scaled 0-1.
+
+    Side-view detection:
+    - In a true side view, MediaPipe may fail to detect the person entirely
+      (the far side is fully occluded) or detect with very low visibility on
+      one shoulder. A low detection rate is itself a strong side-view signal.
+    - If only one shoulder is visible, shoulder_spread ≈ 0 → side view.
+
+    Handle edge cases:
+    - If person not visible in enough frames, return ('side', 0.0) as fallback
+    - Reset cap to frame 0 after detection
+    """
+    ratios = []
+    frames_read = 0
+    frames_with_any_pose = 0
+
+    for _ in range(num_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frames_read += 1
+        landmarks, visibility = pose_detector.detect(frame)
+
+        if not landmarks:
+            continue
+
+        frames_with_any_pose += 1
+
+        # Get available landmarks
+        left_shoulder = landmarks.get("left_shoulder")
+        right_shoulder = landmarks.get("right_shoulder")
+        left_hip = landmarks.get("left_hip")
+        right_hip = landmarks.get("right_hip")
+
+        # Calculate shoulder spread - need at least both shoulders
+        if left_shoulder and right_shoulder:
+            shoulder_spread = abs(left_shoulder[0] - right_shoulder[0])
+
+            # Filter by visibility - if far shoulder has low visibility,
+            # the spread measurement is unreliable but still useful as a signal
+            ls_vis = visibility.get("left_shoulder", 0)
+            rs_vis = visibility.get("right_shoulder", 0)
+            min_shoulder_vis = min(ls_vis, rs_vis)
+
+            # Calculate torso height from whatever hip/shoulder data we have
+            torso_height = None
+
+            if left_hip and right_hip and left_shoulder and right_shoulder:
+                avg_shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2
+                avg_hip_y = (left_hip[1] + right_hip[1]) / 2
+                torso_height = abs(avg_shoulder_y - avg_hip_y)
+            else:
+                # Use whichever side has both shoulder + hip
+                for side_s, side_h in [(left_shoulder, left_hip), (right_shoulder, right_hip)]:
+                    if side_s and side_h:
+                        torso_height = abs(side_s[1] - side_h[1])
+                        break
+
+            if torso_height and torso_height > 0.01:
+                ratio = shoulder_spread / torso_height
+
+                # Weight by shoulder visibility - low-vis far shoulder
+                # means the spread is artificially small (side view signal)
+                # but we still record it as-is since that's the correct signal
+                ratios.append(ratio)
+
+        elif (left_shoulder or right_shoulder) and not (left_shoulder and right_shoulder):
+            # Only ONE shoulder visible - very strong side view signal
+            # Treat as ratio ≈ 0
+            ratios.append(0.0)
+
+    # Reset video capture to beginning
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    pose_detector.frame_count = 0
+
+    # Use detection rate as a signal
+    # If MediaPipe can barely detect a person, it's likely a side view
+    # (the model struggles with fully perpendicular views)
+    detection_rate = frames_with_any_pose / frames_read if frames_read > 0 else 0
+
+    if len(ratios) == 0:
+        # No ratio data at all
+        if detection_rate < 0.1:
+            # Almost no detections - likely extreme side view or no person
+            return ('side', 0.3 if frames_read > 10 else 0.0)
+        return ('side', 0.0)
+
+    # If very few frames had ratio data but some had pose detection,
+    # the ones without both shoulders are likely side-view frames
+    if len(ratios) < frames_read // 4 and frames_with_any_pose > len(ratios):
+        # Many frames detected a person but couldn't get both shoulders
+        # This is a side-view signal
+        return ('side', 0.5)
+
+    # Calculate median ratio for robustness
+    median_ratio = np.median(ratios)
+
+    # Determine angle and confidence
+    # Thresholds: side < 0.25, angled 0.25-0.6, front > 0.6
+    if median_ratio > 0.6:
+        angle = 'front'
+        distance = median_ratio - 0.6
+        confidence = min(1.0, distance / 0.35)
+    elif median_ratio < 0.25:
+        angle = 'side'
+        distance = 0.25 - median_ratio
+        confidence = min(1.0, distance / 0.25)
+    else:
+        angle = 'angled'
+        dist_to_low = median_ratio - 0.25
+        dist_to_high = 0.6 - median_ratio
+        min_distance = min(dist_to_low, dist_to_high)
+        confidence = min(1.0, min_distance / 0.175)
+
+    # Boost side-view confidence if detection rate is low
+    # (model struggles with side views → fewer detections)
+    if angle == 'side' and detection_rate < 0.5:
+        confidence = max(confidence, 0.4)
+
+    return (angle, confidence)
+
 class LiveShotDetector:
     """
     Detects shots using release-backward approach.
@@ -860,12 +1019,14 @@ class LiveShotDetector:
     3. Capture more frames between load and release (the actual shooting motion)
     """
     
-    def __init__(self, shooting_side: str = "right"):
+    def __init__(self, shooting_side: str = "right", camera_angle: str = "side"):
         self.side = shooting_side
-        
+        self.camera_angle = camera_angle
+
         # Buffers
         self.frames_buffer = []
         self.landmarks_buffer = []
+        self.visibility_buffer = []
         self.elbow_angles = []
         self.wrist_heights = []
         self.max_buffer = 180
@@ -912,6 +1073,7 @@ class LiveShotDetector:
         # Store in buffers
         self.frames_buffer.append(frame.copy())
         self.landmarks_buffer.append(landmarks.copy() if landmarks else {})
+        self.visibility_buffer.append(visibility.copy() if visibility else {})
         self.elbow_angles.append(elbow_angle)
         self.wrist_heights.append(wrist_y)
         self._trim_buffer()
@@ -941,17 +1103,100 @@ class LiveShotDetector:
         v2 = np.array([p3[0] - p2[0], p3[1] - p2[1]])
         cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
         return np.degrees(np.arccos(np.clip(cos_angle, -1, 1)))
+
+    @staticmethod
+    def compute_shoulder_ratio(landmarks: Dict) -> Optional[float]:
+        """Compute shoulder_spread / torso_height ratio from landmarks.
+        Returns None if insufficient landmarks."""
+        left_shoulder = landmarks.get("left_shoulder")
+        right_shoulder = landmarks.get("right_shoulder")
+        left_hip = landmarks.get("left_hip")
+        right_hip = landmarks.get("right_hip")
+
+        if not (left_shoulder and right_shoulder):
+            return None
+
+        shoulder_spread = abs(left_shoulder[0] - right_shoulder[0])
+
+        # Torso height from whatever hip data is available
+        torso_height = None
+        if left_hip and right_hip:
+            avg_shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2
+            avg_hip_y = (left_hip[1] + right_hip[1]) / 2
+            torso_height = abs(avg_shoulder_y - avg_hip_y)
+        else:
+            for s, h in [(left_shoulder, left_hip), (right_shoulder, right_hip)]:
+                if s and h:
+                    torso_height = abs(s[1] - h[1])
+                    break
+
+        if not torso_height or torso_height < 0.01:
+            return None
+
+        return shoulder_spread / torso_height
+
+    @staticmethod
+    def classify_angle(ratio: float) -> str:
+        """Classify a shoulder ratio into angle category."""
+        if ratio > 0.6:
+            return 'front'
+        elif ratio < 0.25:
+            return 'side'
+        return 'angled'
+
+    def detect_angle_from_shot(self, load_idx: int, release_idx: int) -> Tuple[str, float]:
+        """Detect camera angle from landmarks during a shot's load-to-release window.
+
+        Uses shoulder_spread / torso_height ratio. MediaPipe always places both
+        shoulder landmarks even from pure side view (just very close together),
+        so realistic ratio ranges are:
+            side:  0.05 - 0.25
+            front: 0.60 - 1.20+
+
+        Confidence is scaled to these realistic ranges so side and front views
+        both achieve high confidence when clearly classified.
+
+        Returns (angle, confidence).
+        """
+        ratios = []
+        for i in range(load_idx, min(release_idx + 1, len(self.landmarks_buffer))):
+            lm = self.landmarks_buffer[i]
+            ratio = self.compute_shoulder_ratio(lm)
+            if ratio is not None:
+                ratios.append(ratio)
+
+        if not ratios:
+            return ('side', 0.0)
+
+        median_ratio = np.median(ratios)
+        angle = self.classify_angle(median_ratio)
+
+        # Confidence scaled to realistic ranges:
+        # Front: 0.6 is boundary, typical front is 0.8+. Full confidence at 0.8.
+        # Side: 0.25 is boundary, typical side is 0.05-0.15. Full confidence at 0.10.
+        # Angled: between thresholds, confidence by distance from nearest edge.
+        if angle == 'front':
+            confidence = min(1.0, (median_ratio - 0.6) / 0.20)
+        elif angle == 'side':
+            confidence = min(1.0, (0.25 - median_ratio) / 0.15)
+        else:
+            dist = min(median_ratio - 0.25, 0.6 - median_ratio)
+            confidence = min(1.0, dist / 0.175)
+
+        return (angle, max(0.0, confidence))
     
     def _create_shot_from_release(self, release_idx: int) -> Optional[ShotEvent]:
         """
         Work backward from release to find load and create shot event.
-        
-        Frame distribution - 7 frames total:
+
+        Frame distribution - 20 frames total:
+        - PreStance2, PreStance1: 15 and 10 frames before load (footwork)
         - Stance: 5 frames before load
+        - Dip1, Dip2: two frames between stance and load (shooting pocket)
         - Load: minimum elbow angle (deepest bend)
-        - Mid1-Mid4: 4 equidistant frames between load and release
+        - Mid1-Mid8: 8 equidistant frames between load and release (upstroke detail)
         - Release: trigger frame (155°+)
-        - FollowThrough: 5 frames after release
+        - Follow1-Follow5: 3, 6, 10, 15, 22 frames after release (follow-through + guide hand + landing)
         """
         # Search backward for LOAD (minimum elbow angle)
         search_start = max(0, release_idx - 60)
@@ -969,50 +1214,99 @@ class LiveShotDetector:
         if shot_duration < self.MIN_SHOT_FRAMES:
             return None
         
-        # Calculate 4 equidistant frames between load and release
-        # Positions: 20%, 40%, 60%, 80% of the way from load to release
-        mid1_idx = load_idx + int(shot_duration * 0.20)
-        mid2_idx = load_idx + int(shot_duration * 0.40)
-        mid3_idx = load_idx + int(shot_duration * 0.60)
-        mid4_idx = load_idx + int(shot_duration * 0.80)
-        
+        # Calculate 8 equidistant frames between load and release
+        # Positions: ~11%, 22%, 33%, 44%, 56%, 67%, 78%, 89% of the way from load to release
+        mid1_idx = load_idx + int(shot_duration * 0.111)
+        mid2_idx = load_idx + int(shot_duration * 0.222)
+        mid3_idx = load_idx + int(shot_duration * 0.333)
+        mid4_idx = load_idx + int(shot_duration * 0.444)
+        mid5_idx = load_idx + int(shot_duration * 0.556)
+        mid6_idx = load_idx + int(shot_duration * 0.667)
+        mid7_idx = load_idx + int(shot_duration * 0.778)
+        mid8_idx = load_idx + int(shot_duration * 0.889)
+
+        # Pre-stance: footwork frames (15 and 10 frames before load)
+        pre_stance2_idx = max(0, load_idx - 15)
+        pre_stance1_idx = max(0, load_idx - 10)
+
         # Stance: 5 frames before load
         stance_idx = max(0, load_idx - 5)
-        
-        # Follow-through: 5 frames after release (reduced from 12)
-        followthrough_idx = min(release_idx + 5, len(self.frames_buffer) - 1)
-        
+
+        # Dip/pocket path: two frames between stance and load
+        stance_to_load = load_idx - stance_idx
+        dip1_idx = max(0, stance_idx + int(stance_to_load * 0.33))
+        dip2_idx = max(0, stance_idx + int(stance_to_load * 0.67))
+
+        # Follow-through: 5 frames after release (wrist snap, guide hand, balance, landing)
+        follow1_idx = min(release_idx + 3, len(self.frames_buffer) - 1)
+        follow2_idx = min(release_idx + 6, len(self.frames_buffer) - 1)
+        follow3_idx = min(release_idx + 10, len(self.frames_buffer) - 1)
+        follow4_idx = min(release_idx + 15, len(self.frames_buffer) - 1)
+        follow5_idx = min(release_idx + 22, len(self.frames_buffer) - 1)
+
         # Clamp all indices
         def clamp(i):
             return max(0, min(i, len(self.frames_buffer) - 1))
-        
+
+        pre_stance2_idx = clamp(pre_stance2_idx)
+        pre_stance1_idx = clamp(pre_stance1_idx)
         stance_idx = clamp(stance_idx)
+        dip1_idx = clamp(dip1_idx)
+        dip2_idx = clamp(dip2_idx)
         load_idx = clamp(load_idx)
         mid1_idx = clamp(mid1_idx)
         mid2_idx = clamp(mid2_idx)
         mid3_idx = clamp(mid3_idx)
         mid4_idx = clamp(mid4_idx)
+        mid5_idx = clamp(mid5_idx)
+        mid6_idx = clamp(mid6_idx)
+        mid7_idx = clamp(mid7_idx)
+        mid8_idx = clamp(mid8_idx)
         release_idx = clamp(release_idx)
-        followthrough_idx = clamp(followthrough_idx)
-        
-        # Build frames list (8 frames total for more coverage)
+        follow1_idx = clamp(follow1_idx)
+        follow2_idx = clamp(follow2_idx)
+        follow3_idx = clamp(follow3_idx)
+        follow4_idx = clamp(follow4_idx)
+        follow5_idx = clamp(follow5_idx)
+
+        # Build frames list (20 frames total for comprehensive coverage)
         frames = [
-            ("1_Stance", self.frames_buffer[stance_idx]),
-            ("2_Load", self.frames_buffer[load_idx]),
-            ("3_Mid1", self.frames_buffer[mid1_idx]),
-            ("4_Mid2", self.frames_buffer[mid2_idx]),
-            ("5_Mid3", self.frames_buffer[mid3_idx]),
-            ("6_Mid4", self.frames_buffer[mid4_idx]),
-            ("7_Release", self.frames_buffer[release_idx]),
-            ("8_FollowThrough", self.frames_buffer[followthrough_idx]),
+            ("01_PreStance2", self.frames_buffer[pre_stance2_idx]),
+            ("02_PreStance1", self.frames_buffer[pre_stance1_idx]),
+            ("03_Stance", self.frames_buffer[stance_idx]),
+            ("04_Dip1", self.frames_buffer[dip1_idx]),
+            ("05_Dip2", self.frames_buffer[dip2_idx]),
+            ("06_Load", self.frames_buffer[load_idx]),
+            ("07_Mid1", self.frames_buffer[mid1_idx]),
+            ("08_Mid2", self.frames_buffer[mid2_idx]),
+            ("09_Mid3", self.frames_buffer[mid3_idx]),
+            ("10_Mid4", self.frames_buffer[mid4_idx]),
+            ("11_Mid5", self.frames_buffer[mid5_idx]),
+            ("12_Mid6", self.frames_buffer[mid6_idx]),
+            ("13_Mid7", self.frames_buffer[mid7_idx]),
+            ("14_Mid8", self.frames_buffer[mid8_idx]),
+            ("15_Release", self.frames_buffer[release_idx]),
+            ("16_Follow1", self.frames_buffer[follow1_idx]),
+            ("17_Follow2", self.frames_buffer[follow2_idx]),
+            ("18_Follow3", self.frames_buffer[follow3_idx]),
+            ("19_Follow4", self.frames_buffer[follow4_idx]),
+            ("20_Follow5", self.frames_buffer[follow5_idx]),
         ]
         
         # Debug output
         release_angle = self.elbow_angles[release_idx] if release_idx < len(self.elbow_angles) else 0
-        
-        print(f"   Frames: stance={stance_idx}, load={load_idx}, mids=[{mid1_idx},{mid2_idx},{mid3_idx},{mid4_idx}], release={release_idx}, follow={followthrough_idx}")
+
+        # Detect camera angle from this shot's frames
+        shot_angle, shot_angle_conf = self.detect_angle_from_shot(load_idx, release_idx)
+        self.camera_angle = shot_angle  # Update for downstream use
+
+        print(f"   Frames: pre=[{pre_stance2_idx},{pre_stance1_idx}], stance={stance_idx}, dip=[{dip1_idx},{dip2_idx}], load={load_idx}, mids=[{mid1_idx},{mid2_idx},{mid3_idx},{mid4_idx},{mid5_idx},{mid6_idx},{mid7_idx},{mid8_idx}], release={release_idx}, follow=[{follow1_idx},{follow2_idx},{follow3_idx},{follow4_idx},{follow5_idx}]")
         print(f"   Angles: load={min_angle:.0f}°, release={release_angle:.0f}°")
+        print(f"   Camera: {shot_angle} (confidence: {shot_angle_conf:.2f})")
         print(f"   Shot duration: {shot_duration} frames")
+
+        # Save debug frame with angle annotation
+        self._save_debug_frame(load_idx, shot_angle, shot_angle_conf)
         
         # Calculate metrics
         load_landmarks = self.landmarks_buffer[load_idx]
@@ -1020,7 +1314,32 @@ class LiveShotDetector:
         
         knee_bend = self._calculate_knee_bend(load_landmarks)
         wrist_height = self._calculate_wrist_height(release_landmarks)
-        
+
+        # Side-view metrics (primary)
+        hip_angle = 0.0
+        elbow_height = 0.0
+        heel_height = 0.0
+        trunk_lean = 0.0
+        if shot_angle in ('side', 'angled'):
+            hip_angle = self._calculate_hip_angle(load_landmarks)
+            elbow_height = self._calculate_elbow_height(load_landmarks)
+            heel_height = self._calculate_heel_height(load_landmarks, release_landmarks)
+            trunk_lean = self._calculate_trunk_lean(release_landmarks)
+
+        # Front-view metrics (supplementary)
+        stance_w = 0.0
+        shoulder_diff = 0.0
+        elbow_offset = 0.0
+        if shot_angle in ('front', 'angled'):
+            stance_w = self._calculate_stance_width(load_landmarks)
+            shoulder_diff = self._calculate_shoulder_level_diff(release_landmarks)
+            elbow_offset = self._calculate_elbow_lateral_offset(release_landmarks)
+
+        # Motion quality metrics (all views)
+        hitch_count, hitch_severity, motion_smoothness = self._calculate_hitch_metrics(stance_idx, load_idx, release_idx)
+        pocket_sweep = self._calculate_pocket_sweep(stance_idx, load_idx, release_idx)
+        dip_depth = self._calculate_dip_depth(stance_idx, load_idx)
+
         return ShotEvent(
             shot_number=0,
             timestamp=time.time(),
@@ -1028,7 +1347,21 @@ class LiveShotDetector:
             elbow_angle_load=min_angle,
             elbow_angle_release=release_angle or 170,
             wrist_height_release=wrist_height,
-            knee_bend_load=knee_bend
+            knee_bend_load=knee_bend,
+            camera_angle=shot_angle,
+            camera_angle_confidence=shot_angle_conf,
+            hip_angle_load=hip_angle,
+            elbow_height_load=elbow_height,
+            heel_height_release=heel_height,
+            trunk_lean_release=trunk_lean,
+            stance_width=stance_w,
+            shoulder_level_diff=shoulder_diff,
+            elbow_lateral_offset=elbow_offset,
+            hitch_count=hitch_count,
+            hitch_severity=hitch_severity,
+            motion_smoothness=motion_smoothness,
+            pocket_lateral_sweep=pocket_sweep,
+            dip_depth=dip_depth,
         )
     
     def _calculate_knee_bend(self, landmarks: Dict) -> float:
@@ -1047,22 +1380,345 @@ class LiveShotDetector:
         wrist = landmarks.get(f"{self.side}_wrist")
         hip = landmarks.get(f"{self.side}_hip")
         shoulder = landmarks.get(f"{self.side}_shoulder")
-        
+
         if not all([wrist, hip, shoulder]):
             return 0.0
-        
+
         body_height = abs(shoulder[1] - hip[1])
         if body_height < 0.01:
             return 0.0
-        
+
         wrist_from_hip = hip[1] - wrist[1]
         return wrist_from_hip / body_height
-    
+
+    def _calculate_hip_angle(self, landmarks: Dict) -> float:
+        """Calculate hip angle (shoulder-hip-knee) at load position."""
+        shoulder = landmarks.get(f"{self.side}_shoulder")
+        hip = landmarks.get(f"{self.side}_hip")
+        knee = landmarks.get(f"{self.side}_knee")
+
+        if not all([shoulder, hip, knee]):
+            return 0.0
+
+        return self._calculate_angle(shoulder, hip, knee)
+
+    def _calculate_elbow_height(self, landmarks: Dict) -> float:
+        """Calculate elbow height normalized to torso (0=hip, 1=shoulder)."""
+        elbow = landmarks.get(f"{self.side}_elbow")
+        hip = landmarks.get(f"{self.side}_hip")
+        shoulder = landmarks.get(f"{self.side}_shoulder")
+
+        if not all([elbow, hip, shoulder]):
+            return 0.0
+
+        torso_height = abs(shoulder[1] - hip[1])
+        if torso_height < 0.01:
+            return 0.0
+
+        elbow_from_hip = hip[1] - elbow[1]  # Y increases downward
+        return elbow_from_hip / torso_height
+
+    def _calculate_heel_height(self, load_landmarks: Dict, release_landmarks: Dict) -> float:
+        """Calculate ankle rise from load to release (normalized to torso)."""
+        load_ankle = load_landmarks.get(f"{self.side}_ankle")
+        release_ankle = release_landmarks.get(f"{self.side}_ankle")
+        load_hip = load_landmarks.get(f"{self.side}_hip")
+        load_shoulder = load_landmarks.get(f"{self.side}_shoulder")
+
+        if not all([load_ankle, release_ankle, load_hip, load_shoulder]):
+            return 0.0
+
+        torso_height = abs(load_shoulder[1] - load_hip[1])
+        if torso_height < 0.01:
+            return 0.0
+
+        # Ankle Y decrease = rise (Y increases downward in normalized coords)
+        ankle_rise = load_ankle[1] - release_ankle[1]
+        return ankle_rise / torso_height
+
+    def _calculate_trunk_lean(self, landmarks: Dict) -> float:
+        """Calculate trunk lean angle from vertical (degrees).
+        Negative = leaning forward, Positive = leaning backward."""
+        shoulder = landmarks.get(f"{self.side}_shoulder")
+        hip = landmarks.get(f"{self.side}_hip")
+
+        if not all([shoulder, hip]):
+            return 0.0
+
+        # Vector from hip to shoulder
+        dx = shoulder[0] - hip[0]
+        dy = hip[1] - shoulder[1]  # Flip Y since Y increases downward
+
+        # Angle from vertical (straight up = 0°)
+        angle_from_vertical = np.degrees(np.arctan2(dx, dy))
+        return angle_from_vertical
+
+    def _calculate_stance_width(self, landmarks: Dict) -> float:
+        """Calculate stance width as ratio of ankle spread to shoulder width."""
+        left_ankle = landmarks.get("left_ankle")
+        right_ankle = landmarks.get("right_ankle")
+        left_shoulder = landmarks.get("left_shoulder")
+        right_shoulder = landmarks.get("right_shoulder")
+
+        if not all([left_ankle, right_ankle, left_shoulder, right_shoulder]):
+            return 0.0
+
+        shoulder_width = abs(left_shoulder[0] - right_shoulder[0])
+        if shoulder_width < 0.01:
+            return 0.0
+
+        ankle_spread = abs(left_ankle[0] - right_ankle[0])
+        return ankle_spread / shoulder_width
+
+    def _calculate_shoulder_level_diff(self, landmarks: Dict) -> float:
+        """Calculate shoulder level difference normalized to torso height.
+        Positive = shooting shoulder is higher."""
+        left_shoulder = landmarks.get("left_shoulder")
+        right_shoulder = landmarks.get("right_shoulder")
+        left_hip = landmarks.get("left_hip")
+        right_hip = landmarks.get("right_hip")
+
+        if not all([left_shoulder, right_shoulder, left_hip, right_hip]):
+            return 0.0
+
+        avg_shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2
+        avg_hip_y = (left_hip[1] + right_hip[1]) / 2
+        torso_height = abs(avg_shoulder_y - avg_hip_y)
+        if torso_height < 0.01:
+            return 0.0
+
+        # Shoulder Y diff (remember Y increases downward)
+        if self.side == "right":
+            diff = left_shoulder[1] - right_shoulder[1]  # Positive when right is higher
+        else:
+            diff = right_shoulder[1] - left_shoulder[1]  # Positive when left is higher
+
+        return diff / torso_height
+
+    def _calculate_elbow_lateral_offset(self, landmarks: Dict) -> float:
+        """Calculate shooting elbow lateral offset from shoulder, normalized to shoulder width.
+        0 = directly under shoulder, positive = flared out."""
+        elbow = landmarks.get(f"{self.side}_elbow")
+        shoulder = landmarks.get(f"{self.side}_shoulder")
+        left_shoulder = landmarks.get("left_shoulder")
+        right_shoulder = landmarks.get("right_shoulder")
+
+        if not all([elbow, shoulder, left_shoulder, right_shoulder]):
+            return 0.0
+
+        shoulder_width = abs(left_shoulder[0] - right_shoulder[0])
+        if shoulder_width < 0.01:
+            return 0.0
+
+        # How far the elbow is from directly under the shoulder (X axis)
+        lateral_offset = abs(elbow[0] - shoulder[0])
+        return lateral_offset / shoulder_width
+
+    def _calculate_hitch_metrics(self, stance_idx: int, load_idx: int, release_idx: int) -> Tuple[int, float, float]:
+        """
+        Detect hitches (pauses/reversals) in the upward shooting motion.
+
+        Returns:
+            (hitch_count, hitch_severity, motion_smoothness)
+        """
+        import numpy as np
+
+        # Get wrist Y positions from load to release
+        wrist_positions = []
+        for i in range(load_idx, release_idx + 1):
+            if i < len(self.landmarks_buffer):
+                lm = self.landmarks_buffer[i]
+                wrist = lm.get(f"{self.side}_wrist")
+                if wrist:
+                    wrist_positions.append(wrist[1])  # Y coordinate (inverted: lower Y = higher)
+
+        if len(wrist_positions) < 4:
+            return 0, 0.0, 1.0
+
+        # Compute frame-to-frame velocity (negative = moving up)
+        velocities = [wrist_positions[i+1] - wrist_positions[i] for i in range(len(wrist_positions) - 1)]
+
+        # Count velocity sign changes (hitch = upward motion reverses to downward then back)
+        hitch_count = 0
+        hitch_max_drop = 0.0
+        i = 0
+        while i < len(velocities):
+            # Look for upward motion (negative velocity)
+            if velocities[i] < -0.001:
+                # Now look for a reversal (positive velocity = downward)
+                j = i + 1
+                while j < len(velocities) and velocities[j] < -0.001:
+                    j += 1
+                # If we found a downward reversal followed by upward again
+                if j < len(velocities) and velocities[j] > 0.001:
+                    # Measure how far wrist drops
+                    drop_start_y = wrist_positions[j]
+                    k = j + 1
+                    while k < len(velocities) and velocities[k] > 0.001:
+                        k += 1
+                    if k < len(wrist_positions):
+                        drop = wrist_positions[k] - drop_start_y
+                        if drop > 0.005:  # Minimum threshold to count as a hitch
+                            hitch_count += 1
+                            hitch_max_drop = max(hitch_max_drop, drop)
+                    i = k
+                    continue
+            i += 1
+
+        # Normalize hitch severity by torso height
+        load_lm = self.landmarks_buffer[load_idx] if load_idx < len(self.landmarks_buffer) else {}
+        shoulder = load_lm.get(f"{self.side}_shoulder")
+        hip = load_lm.get(f"{self.side}_hip")
+        torso_height = abs(shoulder[1] - hip[1]) if shoulder and hip else 0.3
+        hitch_severity = hitch_max_drop / max(torso_height, 0.01)
+
+        # Motion smoothness: ratio of actual path length to straight-line distance
+        actual_path = sum(abs(v) for v in velocities)
+        straight_line = abs(wrist_positions[-1] - wrist_positions[0])
+        motion_smoothness = actual_path / max(straight_line, 0.001)
+
+        return hitch_count, round(hitch_severity, 3), round(motion_smoothness, 2)
+
+    def _calculate_pocket_sweep(self, stance_idx: int, load_idx: int, release_idx: int) -> float:
+        """
+        Calculate lateral sweep of shooting pocket path.
+
+        Returns:
+            pocket_lateral_sweep: max horizontal deviation from straight path,
+            normalized to shoulder width. 0 = straight up, higher = more sweep.
+        """
+        import numpy as np
+
+        # Get wrist X positions from stance to release
+        wrist_x_positions = []
+        for i in range(stance_idx, release_idx + 1):
+            if i < len(self.landmarks_buffer):
+                lm = self.landmarks_buffer[i]
+                wrist = lm.get(f"{self.side}_wrist")
+                if wrist:
+                    wrist_x_positions.append(wrist[0])
+
+        if len(wrist_x_positions) < 3:
+            return 0.0
+
+        # Straight line from start to end
+        start_x = wrist_x_positions[0]
+        end_x = wrist_x_positions[-1]
+        n = len(wrist_x_positions)
+
+        # Compute max deviation from the interpolated straight line
+        max_deviation = 0.0
+        for i, x in enumerate(wrist_x_positions):
+            # Expected X on the straight line at this position
+            expected_x = start_x + (end_x - start_x) * (i / max(n - 1, 1))
+            deviation = abs(x - expected_x)
+            max_deviation = max(max_deviation, deviation)
+
+        # Normalize by shoulder width
+        stance_lm = self.landmarks_buffer[stance_idx] if stance_idx < len(self.landmarks_buffer) else {}
+        left_shoulder = stance_lm.get("left_shoulder")
+        right_shoulder = stance_lm.get("right_shoulder")
+        shoulder_width = abs(left_shoulder[0] - right_shoulder[0]) if left_shoulder and right_shoulder else 0.2
+
+        return round(max_deviation / max(shoulder_width, 0.01), 3)
+
+    def _calculate_dip_depth(self, stance_idx: int, load_idx: int) -> float:
+        """
+        Calculate how deep the ball/wrist dips during the load phase.
+
+        Returns:
+            dip_depth: lowest wrist Y below hip, normalized to torso height.
+            Positive = wrist went below hip level. 0 = wrist stayed at or above hip.
+        """
+        # Get wrist Y positions from stance to load
+        min_wrist_y = float('-inf')  # Remember Y is inverted (higher Y = lower position)
+        for i in range(stance_idx, load_idx + 1):
+            if i < len(self.landmarks_buffer):
+                lm = self.landmarks_buffer[i]
+                wrist = lm.get(f"{self.side}_wrist")
+                if wrist:
+                    min_wrist_y = max(min_wrist_y, wrist[1])  # Max Y = lowest position
+
+        if min_wrist_y == float('-inf'):
+            return 0.0
+
+        # Get hip Y at stance
+        stance_lm = self.landmarks_buffer[stance_idx] if stance_idx < len(self.landmarks_buffer) else {}
+        hip = stance_lm.get(f"{self.side}_hip")
+        shoulder = stance_lm.get(f"{self.side}_shoulder")
+
+        if not hip or not shoulder:
+            return 0.0
+
+        hip_y = hip[1]
+        torso_height = abs(shoulder[1] - hip[1])
+
+        # How far below hip did the wrist go? (positive = below hip)
+        depth_below_hip = min_wrist_y - hip_y
+
+        if depth_below_hip <= 0:
+            return 0.0  # Wrist stayed at or above hip
+
+        return round(depth_below_hip / max(torso_height, 0.01), 3)
+
+    def _save_debug_frame(self, frame_idx: int, angle: str, confidence: float):
+        """Save an annotated frame showing detected camera angle for debugging."""
+        try:
+            debug_dir = os.path.join(os.path.dirname(__file__), "debug_frames")
+            os.makedirs(debug_dir, exist_ok=True)
+
+            frame = self.frames_buffer[frame_idx].copy()
+            landmarks = self.landmarks_buffer[frame_idx]
+            h, w = frame.shape[:2]
+
+            # Draw shoulder and hip landmarks
+            colors = {
+                "left_shoulder": (0, 255, 0),   # green
+                "right_shoulder": (0, 0, 255),   # red
+                "left_hip": (0, 200, 0),
+                "right_hip": (0, 0, 200),
+            }
+            for name, color in colors.items():
+                pt = landmarks.get(name)
+                if pt:
+                    px, py = int(pt[0] * w), int(pt[1] * h)
+                    cv2.circle(frame, (px, py), 8, color, -1)
+                    cv2.putText(frame, name.replace("_", " "), (px + 10, py - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            # Draw line between shoulders if both visible
+            ls = landmarks.get("left_shoulder")
+            rs = landmarks.get("right_shoulder")
+            if ls and rs:
+                cv2.line(frame,
+                         (int(ls[0] * w), int(ls[1] * h)),
+                         (int(rs[0] * w), int(rs[1] * h)),
+                         (255, 255, 0), 2)
+
+            # Compute and display ratio
+            ratio = self.compute_shoulder_ratio(landmarks)
+            ratio_text = f"ratio: {ratio:.3f}" if ratio is not None else "ratio: N/A"
+
+            # Angle label at top of frame
+            label = f"Camera: {angle} ({confidence:.2f})"
+            cv2.putText(frame, label, (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+            cv2.putText(frame, ratio_text, (20, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+            shot_num = len([f for f in os.listdir(debug_dir) if f.startswith("shot_")]) + 1
+            filename = os.path.join(debug_dir, f"shot_{shot_num:03d}_{angle}.jpg")
+            cv2.imwrite(filename, frame)
+            print(f"   Debug frame saved: {filename}")
+        except Exception as e:
+            print(f"   (Debug frame save failed: {e})")
+
     def _trim_buffer(self):
         """Keep buffer at max size."""
         while len(self.frames_buffer) > self.max_buffer:
             self.frames_buffer.pop(0)
             self.landmarks_buffer.pop(0)
+            self.visibility_buffer.pop(0)
             self.elbow_angles.pop(0)
             self.wrist_heights.pop(0)
             if self.last_shot_frame > 0:
@@ -1564,8 +2220,9 @@ class LiveAnalyzer:
             
             # Create annotated frame from release frame
             if shot.frames and len(shot.frames) > 4:
-                # Get release frame (index 4-5 in 7-frame sequence)
-                label, release_frame = shot.frames[5] if len(shot.frames) > 5 else shot.frames[-1]
+                # Find the release frame by label
+                release_entry = next(((l, f) for l, f in shot.frames if 'Release' in l), shot.frames[-1])
+                label, release_frame = release_entry
                 
                 # Get landmarks from shot detector's buffer if available
                 # For now, we'll run pose detection on the release frame

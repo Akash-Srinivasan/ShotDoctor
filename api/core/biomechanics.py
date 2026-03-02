@@ -62,33 +62,73 @@ RELEASE_HEIGHT = OptimalRange(
 )
 
 # Elbow angle at set point (load position)
-# Source: Multiple studies show 85-100° is common among accurate shooters
+# Source: Cabarkapa et al. (2022) - proficient shooters at lower angles
 ELBOW_ANGLE_LOAD = OptimalRange(
-    min_val=80.0,
-    max_val=100.0,
-    ideal=90.0,
+    min_val=50.0,
+    max_val=70.0,
+    ideal=60.0,
     unit="°",
-    research_note="85-95° elbow angle at set point allows efficient force transfer"
+    research_note="Cabarkapa et al. (2022): proficient shooters ~59-65° elbow at set point"
 )
 
 # Elbow angle at release
-# Source: Full extension (170-180°) correlates with accuracy
+# Source: Okazaki (2012), Diehl et al. - not full extension
 ELBOW_ANGLE_RELEASE = OptimalRange(
-    min_val=160.0,
-    max_val=180.0,
-    ideal=170.0,
+    min_val=130.0,
+    max_val=165.0,
+    ideal=150.0,
     unit="°",
-    research_note="Near-full elbow extension (165-175°) at release is optimal"
+    research_note="Okazaki (2012), Diehl et al.: release at ~134-158°, not full extension"
 )
 
-# Knee bend at load
-# Source: Podmenik et al. (2017) - deeper for longer shots
+# Knee bend at load (interior knee angle: hip-knee-ankle)
+# Source: Cabarkapa et al. (2022) - interior knee angle measurement
 KNEE_BEND_LOAD = OptimalRange(
-    min_val=15.0,
-    max_val=45.0,
-    ideal=30.0,
+    min_val=95.0,
+    max_val=115.0,
+    ideal=107.0,
     unit="°",
-    research_note="20-35° knee bend provides power; increase for longer distances"
+    research_note="Cabarkapa et al. (2022): interior knee angle ~104-110° for proficient 3pt shooters"
+)
+
+# Hip angle at load (shoulder-hip-knee angle)
+# Source: Cabarkapa et al. (2022) - significant discriminator for 3pt proficiency
+HIP_ANGLE_LOAD = OptimalRange(
+    min_val=125.0,
+    max_val=140.0,
+    ideal=135.0,
+    unit="°",
+    research_note="Cabarkapa et al. (2022): hip angle is a key discriminant variable for 3pt proficiency"
+)
+
+# Elbow height at load (normalized to torso)
+# Source: General biomechanics - set point should be at or above eye level
+ELBOW_HEIGHT_LOAD = OptimalRange(
+    min_val=0.60,
+    max_val=0.80,
+    ideal=0.70,
+    unit="normalized",
+    research_note="Elbow at set point should be approximately at eye level relative to torso"
+)
+
+# Heel height at release (ankle rise from load to release)
+# Source: Cabarkapa et al. (2022) - heel height at release was significant discriminator
+HEEL_HEIGHT_RELEASE = OptimalRange(
+    min_val=0.03,
+    max_val=0.20,
+    ideal=0.10,
+    unit="normalized",
+    research_note="Cabarkapa et al. (2022): heel height at release is key discriminant for proficiency"
+)
+
+# Trunk lean at release (angle of shoulder-hip line from vertical)
+# Source: Cabarkapa (2023) - trunk lean at release had large effect size
+TRUNK_LEAN_RELEASE = OptimalRange(
+    min_val=-5.0,
+    max_val=5.0,
+    ideal=-1.0,
+    unit="°",
+    research_note="Cabarkapa (2023): proficient shooters have minimal trunk lean at release; negative = slight forward lean"
 )
 
 # Release time (catch to release)

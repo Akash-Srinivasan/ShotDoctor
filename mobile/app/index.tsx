@@ -107,7 +107,7 @@ export default function Index() {
       <View style={styles.content}>
         <TouchableOpacity
           style={[styles.mainButton, !apiConnected && styles.mainButtonDisabled]}
-          onPress={() => router.push('/record')}
+          onPress={() => router.push('/(tabs)/record')}
           disabled={!apiConnected}
         >
           <Text style={styles.mainButtonText}>📹 Record Session</Text>

@@ -6,6 +6,7 @@
 import 'react-native-url-polyfill/auto';
 import { createClient } from '@supabase/supabase-js';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { decode } from 'base64-arraybuffer';
 
 // ============================================================================
 // Configuration
@@ -101,10 +102,18 @@ export interface Shot {
   elbow_angle_release: number;
   wrist_height_release: number;
   knee_bend_load: number;
+  hip_angle_load: number;
+  elbow_height_load: number;
+  heel_height_release: number;
+  trunk_lean_release: number;
+  stance_width: number;
+  shoulder_level_diff: number;
+  elbow_lateral_offset: number;
   form_rating: number | null;
   feedback: string;
   key_issue: string | null;
   quick_cue: string | null;
+  camera_angle: string | null;
   thumbnail_url: string | null;
   created_at: string;
 }
@@ -332,10 +341,18 @@ export const db = {
       elbow_angle_release: number;
       wrist_height_release: number;
       knee_bend_load: number;
+      hip_angle_load: number;
+      elbow_height_load: number;
+      heel_height_release: number;
+      trunk_lean_release: number;
+      stance_width: number;
+      shoulder_level_diff: number;
+      elbow_lateral_offset: number;
       form_rating: number | null;
       feedback: string;
       key_issue: string | null;
       quick_cue: string | null;
+      camera_angle: string | null;
       thumbnail_url: string | null;
     }>
   ): Promise<Shot[]> {
@@ -470,20 +487,11 @@ export const db = {
     if (!user) return null;
 
     try {
-      // Convert base64 to blob
-      const byteCharacters = atob(base64Data);
-      const byteNumbers = new Array(byteCharacters.length);
-      for (let i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
-      }
-      const byteArray = new Uint8Array(byteNumbers);
-      const blob = new Blob([byteArray], { type: 'image/jpeg' });
-
       const fileName = `${user.id}/${sessionId}/shot_${shotNumber}.jpg`;
-      
+
       const { data, error } = await supabase.storage
         .from('thumbnails')
-        .upload(fileName, blob, {
+        .upload(fileName, decode(base64Data), {
           contentType: 'image/jpeg',
           upsert: true,
         });

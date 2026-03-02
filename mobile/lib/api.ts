@@ -8,7 +8,7 @@
 // ============================================================================
 
 const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:8000';
-const API_TIMEOUT = 120000; // 2 minutes for video analysis
+const API_TIMEOUT = 600000; // 10 minutes for video analysis (upload + multi-shot Gemini calls + retries)
 
 // ============================================================================
 // Types
@@ -26,7 +26,16 @@ export interface ShotAnalysis {
   elbow_angle_release: number;
   wrist_height_release: number;
   knee_bend_load: number;
+  hip_angle_load: number;
+  elbow_height_load: number;
+  heel_height_release: number;
+  trunk_lean_release: number;
+  stance_width: number;
+  shoulder_level_diff: number;
+  elbow_lateral_offset: number;
+  camera_angle: string | null; // "side", "front", "angled"
   thumbnail: string; // Base64 encoded
+  timestamp: number; // seconds into video when shot detected
 }
 
 export interface SessionSummary {
@@ -154,21 +163,37 @@ export async function getHealthStatus(): Promise<HealthResponse | null> {
   }
 }
 
+// Rim position for make/miss detection
+export interface RimPosition {
+  x: number; // Normalized 0-1
+  y: number; // Normalized 0-1
+}
+
 /**
  * Analyze a video for basketball shots
  */
+export interface UserContext {
+  skill_level?: string;
+  focus_areas?: string;
+  height_inches?: number;
+  user_id?: string;
+}
+
 export async function analyzeVideo(
   videoUri: string,
   shootingHand: 'left' | 'right' = 'right',
-  playerId?: number
+  rimPosition?: RimPosition | null,
+  playerId?: number,
+  sessionId?: string,
+  userContext?: UserContext
 ): Promise<SessionSummary> {
   // Create form data for file upload
   const formData = new FormData();
-  
+
   // Get file info from URI
   const uriParts = videoUri.split('/');
   const fileName = uriParts[uriParts.length - 1] || 'video.mp4';
-  
+
   // Determine mime type
   const extension = fileName.split('.').pop()?.toLowerCase() || 'mp4';
   const mimeTypes: Record<string, string> = {
@@ -191,9 +216,33 @@ export async function analyzeVideo(
   const params = new URLSearchParams({
     shooting_side: shootingHand,
   });
-  
+
+  // Add rim position if provided
+  if (rimPosition) {
+    params.append('rim_x', rimPosition.x.toString());
+    params.append('rim_y', rimPosition.y.toString());
+  }
+
   if (playerId !== undefined) {
     params.append('player_id', playerId.toString());
+  }
+
+  if (sessionId) {
+    params.append('session_id', sessionId);
+  }
+
+  // User context for personalized analysis
+  if (userContext?.skill_level) {
+    params.append('skill_level', userContext.skill_level);
+  }
+  if (userContext?.focus_areas) {
+    params.append('focus_areas', userContext.focus_areas);
+  }
+  if (userContext?.height_inches) {
+    params.append('height_inches', userContext.height_inches.toString());
+  }
+  if (userContext?.user_id) {
+    params.append('user_id', userContext.user_id);
   }
 
   const url = `${API_URL}/analyze?${params.toString()}`;
@@ -227,8 +276,8 @@ export async function analyzeVideo(
     if (error instanceof Error) {
       const apiError: ApiError = error;
       
-      if (apiError.message.includes('timeout')) {
-        throw new Error('Video analysis timed out. Try a shorter video.');
+      if (apiError.message.includes('timed out')) {
+        throw new Error('Video analysis timed out. The server may still be processing — check your History tab in a few minutes.');
       }
       
       if (apiError.status === 404) {
@@ -243,6 +292,60 @@ export async function analyzeVideo(
     }
     
     throw new Error('Unknown error during video analysis');
+  }
+}
+
+// ============================================================================
+// Shot Fingerprint
+// ============================================================================
+
+export interface ImprovementArea {
+  metric: string;
+  label: string;
+  make_avg: number;
+  miss_avg: number;
+  delta: number;
+  optimal: number;
+  impact_score: number;
+  insight: string;
+  cue: string;
+  direction: string;
+}
+
+export interface ShotFingerprint {
+  session_count: number;
+  total_shots: number;
+  fingerprint_ready: boolean;
+  make_signature: Record<string, { avg: number; std: number }>;
+  miss_signature: Record<string, { avg: number; std: number }>;
+  improvement_areas: ImprovementArea[];
+  consistency: Record<string, number>;
+  miss_distribution: Record<string, number>;
+  trend: {
+    shooting_pct: number[];
+    form_rating: number[];
+    direction: string;
+  };
+  cues: string[];
+  miss_tendency_cue: string;
+  trend_label: string;
+  consistency_note: string;
+}
+
+/**
+ * Get user's shot fingerprint
+ */
+export async function getFingerprint(userId: string): Promise<ShotFingerprint | null> {
+  try {
+    const response = await fetchWithTimeout(
+      `${API_URL}/fingerprint/${userId}`,
+      { method: 'GET' },
+      10000
+    );
+    return handleResponse<ShotFingerprint>(response);
+  } catch (error) {
+    console.error('Fingerprint fetch failed:', error);
+    return null;
   }
 }
 
@@ -269,7 +372,7 @@ export async function getApiInfo(): Promise<{
 }
 
 // ============================================================================
-// Progress Tracking (for future WebSocket implementation)
+// Progress Tracking (polling-based)
 // ============================================================================
 
 export type AnalysisProgress = {
@@ -278,54 +381,165 @@ export type AnalysisProgress = {
   message: string;
   shotsFound?: number;
   currentShot?: number;
+  frame?: number;
+  totalFrames?: number;
 };
 
 export type ProgressCallback = (progress: AnalysisProgress) => void;
 
+interface ApiProgressResponse {
+  stage: string;
+  progress: number;
+  message: string;
+  frame?: number;
+  total_frames?: number;
+  shots_found?: number;
+  current_shot?: number;
+}
+
 /**
- * Analyze video with progress updates
- * TODO: Implement WebSocket or SSE for real progress tracking
+ * Poll the progress endpoint for a session
+ */
+async function getProgress(sessionId: string): Promise<ApiProgressResponse | null> {
+  try {
+    const response = await fetchWithTimeout(
+      `${API_URL}/progress/${sessionId}`,
+      { method: 'GET' },
+      5000
+    );
+    if (!response.ok) return null;
+    return response.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Map API stage names to client stage names
+ */
+function mapStage(apiStage: string): AnalysisProgress['stage'] {
+  switch (apiStage) {
+    case 'uploading': return 'uploading';
+    case 'detecting': return 'detecting';
+    case 'analyzing_shot': return 'analyzing';
+    case 'generating_summary': return 'generating';
+    case 'complete': return 'complete';
+    default: return 'uploading';
+  }
+}
+
+/**
+ * Analyze video with real progress polling from the API
  */
 export async function analyzeVideoWithProgress(
   videoUri: string,
   shootingHand: 'left' | 'right',
   onProgress: ProgressCallback,
-  playerId?: number
+  rimPosition?: RimPosition | null,
+  playerId?: number,
+  sessionId?: string,
+  userContext?: UserContext
 ): Promise<SessionSummary> {
-  // Simulate progress stages while the actual request is happening
-  // In a real implementation, this would use WebSockets or polling
-  
-  const progressStages: AnalysisProgress[] = [
-    { stage: 'uploading', progress: 10, message: 'Uploading video...' },
-    { stage: 'detecting', progress: 30, message: 'Detecting shots...' },
-    { stage: 'analyzing', progress: 50, message: 'Analyzing form...' },
-    { stage: 'generating', progress: 80, message: 'Generating feedback...' },
-  ];
+  // Start polling progress if we have a session ID
+  let pollInterval: ReturnType<typeof setInterval> | null = null;
 
-  // Start progress simulation
-  let stageIndex = 0;
-  const progressInterval = setInterval(() => {
-    if (stageIndex < progressStages.length) {
-      onProgress(progressStages[stageIndex]);
-      stageIndex++;
-    }
-  }, 2500);
+  if (sessionId) {
+    pollInterval = setInterval(async () => {
+      const progress = await getProgress(sessionId);
+      if (progress && progress.stage !== 'unknown') {
+        onProgress({
+          stage: mapStage(progress.stage),
+          progress: progress.progress,
+          message: progress.message,
+          shotsFound: progress.shots_found,
+          currentShot: progress.current_shot,
+          frame: progress.frame,
+          totalFrames: progress.total_frames,
+        });
+      }
+    }, 1500);
+  }
 
   try {
-    const result = await analyzeVideo(videoUri, shootingHand, playerId);
-    
-    // Complete progress
-    clearInterval(progressInterval);
+    const result = await analyzeVideo(videoUri, shootingHand, rimPosition, playerId, sessionId, userContext);
+
+    if (pollInterval) clearInterval(pollInterval);
     onProgress({
       stage: 'complete',
       progress: 100,
       message: 'Analysis complete!',
       shotsFound: result.total_shots,
     });
-    
+
     return result;
   } catch (error) {
-    clearInterval(progressInterval);
+    // If the network dropped but server is still processing, keep polling
+    // and wait for the result instead of crashing immediately
+    if (sessionId && error instanceof Error &&
+        (error.message.includes('Network request failed') || error.message.includes('timed out'))) {
+      console.log('⚠️ Upload connection lost, but server may still be processing. Polling for result...');
+      onProgress({
+        stage: 'analyzing',
+        progress: 50,
+        message: 'Connection interrupted — waiting for server to finish...',
+      });
+
+      // Poll progress until complete or truly failed (up to 8 minutes)
+      const maxWaitMs = 480000;
+      const pollMs = 3000;
+      const startTime = Date.now();
+
+      while (Date.now() - startTime < maxWaitMs) {
+        await new Promise(r => setTimeout(r, pollMs));
+        try {
+          const progress = await getProgress(sessionId);
+          if (progress && progress.stage !== 'unknown') {
+            onProgress({
+              stage: mapStage(progress.stage),
+              progress: progress.progress,
+              message: progress.message,
+              shotsFound: progress.shots_found,
+              currentShot: progress.current_shot,
+            });
+
+            // If server finished, try fetching result one more time
+            if (progress.stage === 'complete' || progress.progress >= 98) {
+              try {
+                // Small delay to let server finalize response
+                await new Promise(r => setTimeout(r, 2000));
+                // The result is already saved to DB by the server at this point,
+                // so we can construct a minimal success response
+                onProgress({
+                  stage: 'complete',
+                  progress: 100,
+                  message: 'Analysis complete! Check your History tab.',
+                  shotsFound: progress.shots_found,
+                });
+                if (pollInterval) clearInterval(pollInterval);
+                // Return a signal that analysis succeeded but result was lost
+                // The calling code should redirect to history
+                throw new Error('ANALYSIS_COMPLETE_CONNECTION_LOST');
+              } catch (retryError) {
+                if (pollInterval) clearInterval(pollInterval);
+                throw retryError;
+              }
+            }
+          }
+        } catch (pollError) {
+          // Progress poll failed — server might be down
+          if (pollError instanceof Error && pollError.message === 'ANALYSIS_COMPLETE_CONNECTION_LOST') {
+            throw pollError;
+          }
+          console.log('Progress poll failed, retrying...', pollError);
+        }
+      }
+
+      // Timed out waiting
+      if (pollInterval) clearInterval(pollInterval);
+      throw new Error('Analysis is still processing on the server. Check your History tab in a few minutes.');
+    }
+
+    if (pollInterval) clearInterval(pollInterval);
     throw error;
   }
 }

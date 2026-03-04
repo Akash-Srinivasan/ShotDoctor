@@ -36,7 +36,7 @@ export function RecordingCamera({ onVideoRecorded, onCancel }: RecordingCameraPr
       console.log('🎥 Starting recording...');
       
       const video = await cameraRef.current.recordAsync({
-        maxDuration: 300, // 5 minutes max
+        maxDuration: 180, // 3 minutes max
       });
 
       console.log('✓ Recording complete:', video.uri);

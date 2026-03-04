@@ -109,7 +109,7 @@ class ShotEvent:
     shot_number: int
     timestamp: float
     # Multiple frames capturing the full shot motion
-    frames: List[Tuple[str, np.ndarray]]  # List of (label, frame)
+    frames: List[Tuple[str, bytes]]  # List of (label, jpeg_bytes)
     elbow_angle_load: float
     elbow_angle_release: float
     wrist_height_release: float = 0.0
@@ -224,7 +224,7 @@ class LiveState:
     all_feedback_given: List[str] = field(default_factory=list)
     
     # Visual feedback storage
-    last_shot_frames: List[Tuple[str, np.ndarray]] = field(default_factory=list)
+    last_shot_frames: List[Tuple[str, bytes]] = field(default_factory=list)  # JPEG bytes
     last_shot_landmarks: List[Dict] = field(default_factory=list)
     last_shot_metrics: Optional[Dict] = None
     last_shot_issues: List[Dict] = field(default_factory=list)
@@ -536,11 +536,10 @@ Respond in JSON:
             genai.configure(api_key=self.api_key)
             model = genai.GenerativeModel(GEMINI_MODEL)
             
-            # Encode all frames as base64
+            # Frames are already JPEG bytes from the buffer
             frames_data = []
-            for label, frame in shot.frames:
-                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                b64 = base64.b64encode(buffer).decode('utf-8')
+            for label, jpg_bytes in shot.frames:
+                b64 = base64.b64encode(jpg_bytes).decode('utf-8')
                 frames_data.append({"label": label, "data": b64})
             
             # Build prompt (include local analysis if available)
@@ -1070,8 +1069,9 @@ class LiveShotDetector:
         else:
             self.stability_count = 0
         
-        # Store in buffers
-        self.frames_buffer.append(frame.copy())
+        # Store in buffers (JPEG-compressed to reduce memory ~40x)
+        _, jpg_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        self.frames_buffer.append(bytes(jpg_buf))
         self.landmarks_buffer.append(landmarks.copy() if landmarks else {})
         self.visibility_buffer.append(visibility.copy() if visibility else {})
         self.elbow_angles.append(elbow_angle)
@@ -1544,21 +1544,21 @@ class LiveShotDetector:
         i = 0
         while i < len(velocities):
             # Look for upward motion (negative velocity)
-            if velocities[i] < -0.001:
+            if velocities[i] < -0.005:
                 # Now look for a reversal (positive velocity = downward)
                 j = i + 1
-                while j < len(velocities) and velocities[j] < -0.001:
+                while j < len(velocities) and velocities[j] < -0.005:
                     j += 1
                 # If we found a downward reversal followed by upward again
-                if j < len(velocities) and velocities[j] > 0.001:
+                if j < len(velocities) and velocities[j] > 0.005:
                     # Measure how far wrist drops
                     drop_start_y = wrist_positions[j]
                     k = j + 1
-                    while k < len(velocities) and velocities[k] > 0.001:
+                    while k < len(velocities) and velocities[k] > 0.005:
                         k += 1
                     if k < len(wrist_positions):
                         drop = wrist_positions[k] - drop_start_y
-                        if drop > 0.005:  # Minimum threshold to count as a hitch
+                        if drop > 0.015:  # Minimum threshold to count as a hitch
                             hitch_count += 1
                             hitch_max_drop = max(hitch_max_drop, drop)
                     i = k
@@ -1667,7 +1667,8 @@ class LiveShotDetector:
             debug_dir = os.path.join(os.path.dirname(__file__), "debug_frames")
             os.makedirs(debug_dir, exist_ok=True)
 
-            frame = self.frames_buffer[frame_idx].copy()
+            jpg_bytes = self.frames_buffer[frame_idx]
+            frame = cv2.imdecode(np.frombuffer(jpg_bytes, np.uint8), cv2.IMREAD_COLOR)
             landmarks = self.landmarks_buffer[frame_idx]
             h, w = frame.shape[:2]
 
@@ -2222,8 +2223,10 @@ class LiveAnalyzer:
             if shot.frames and len(shot.frames) > 4:
                 # Find the release frame by label
                 release_entry = next(((l, f) for l, f in shot.frames if 'Release' in l), shot.frames[-1])
-                label, release_frame = release_entry
-                
+                label, release_jpg = release_entry
+                # Decode JPEG bytes back to numpy for annotation
+                release_frame = cv2.imdecode(np.frombuffer(release_jpg, np.uint8), cv2.IMREAD_COLOR)
+
                 # Get landmarks from shot detector's buffer if available
                 # For now, we'll run pose detection on the release frame
                 landmarks, _ = self.pose.detect(release_frame)
@@ -2393,9 +2396,10 @@ class LiveAnalyzer:
                     shot_dir.mkdir(exist_ok=True)
                     
                     print(f"   💾 Saving {len(shot_event.frames)} frames to {shot_dir}/")
-                    for i, (label, frame_img) in enumerate(shot_event.frames):
+                    for i, (label, jpg_bytes) in enumerate(shot_event.frames):
                         filename = shot_dir / f"{i}_{label.replace(' ', '_')}.jpg"
-                        cv2.imwrite(str(filename), frame_img)
+                        with open(str(filename), 'wb') as f:
+                            f.write(jpg_bytes)
                     print(f"   ✓ Frames saved for debugging")
                 
                 # Send to Gemini for analysis (pass state and local analysis)

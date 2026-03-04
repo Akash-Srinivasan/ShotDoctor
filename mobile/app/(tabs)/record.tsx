@@ -9,7 +9,8 @@
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { useFocusEffect } from 'expo-router';
+import { useFocusEffect, useNavigation, router } from 'expo-router';
+import { usePreventRemove } from '@react-navigation/native';
 import {
   View,
   Text,
@@ -22,6 +23,7 @@ import {
   Modal,
   Dimensions,
   Animated,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { VideoView, useVideoPlayer } from 'expo-video';
@@ -71,6 +73,41 @@ function RecordScreen() {
       setShootingSide(profile.shooting_hand);
     }
   }, [profile?.shooting_hand]);
+
+  // Prevent swipe-back / navigation during analysis
+  const navigation = useNavigation();
+
+  usePreventRemove(analyzing, () => {
+    Alert.alert(
+      'Analysis in Progress',
+      'Please wait for the analysis to finish before leaving.',
+    );
+  });
+
+  // Hide tab bar during analysis
+  useEffect(() => {
+    const parent = navigation.getParent();
+    if (analyzing) {
+      parent?.setOptions({
+        tabBarStyle: { display: 'none' },
+      });
+    } else {
+      parent?.setOptions({
+        tabBarStyle: {
+          backgroundColor: '#000000',
+          borderTopWidth: 0,
+          height: Platform.OS === 'ios' ? 88 : 65,
+          paddingBottom: Platform.OS === 'ios' ? 30 : 10,
+          paddingTop: 8,
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: -2 },
+          shadowOpacity: 0.1,
+          shadowRadius: 8,
+          elevation: 8,
+        },
+      });
+    }
+  }, [analyzing, navigation]);
 
   // Track if we've left this screen while showing results
   const hadResultOnBlur = useRef(false);
@@ -232,9 +269,17 @@ function RecordScreen() {
     });
 
     if (!pickerResult.canceled && pickerResult.assets[0]) {
-      const uri = pickerResult.assets[0].uri;
-      console.log('📁 Video selected:', uri);
-      setPendingVideoUri(uri);
+      const asset = pickerResult.assets[0];
+      // duration is in milliseconds
+      if (asset.duration && asset.duration > 180_000) {
+        Alert.alert(
+          'Video Too Long',
+          'Videos must be 3 minutes or shorter. Please trim your video or record a shorter session.',
+        );
+        return;
+      }
+      console.log('📁 Video selected:', asset.uri);
+      setPendingVideoUri(asset.uri);
       setShowCalibration(true);
     }
   }, []);

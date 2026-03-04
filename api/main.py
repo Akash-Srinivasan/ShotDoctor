@@ -174,17 +174,17 @@ class ProgressResponse(BaseModel):
 
 # Cue templates: metric → coaching language
 CUE_TEMPLATES = {
-    "elbow_angle_release": {"low": "Extend your elbow fully on release", "high": "Don't overextend — snap the wrist instead"},
-    "trunk_lean_release": {"low": "Stay tall through your release", "high": "Lean into your shot slightly"},
-    "knee_bend_load": {"low": "Bend your knees more at the set point", "high": "Don't over-bend — stay athletic"},
-    "hip_angle_load": {"low": "Sit into your shot more", "high": "Stay more upright at the set point"},
-    "heel_height_release": {"low": "Get up on your toes at release", "high": "Stay grounded — don't jump too much"},
-    "wrist_height_release": {"low": "Get the ball higher at release", "high": "Release point is good — focus elsewhere"},
-    "elbow_angle_load": {"low": "Bring the ball up higher to your set point", "high": "Keep a tighter set point"},
-    "elbow_height_load": {"low": "Raise your elbow higher at the set point", "high": "Elbow height is good"},
-    "stance_width": {"low": "Widen your stance slightly", "high": "Narrow your stance to shoulder width"},
-    "elbow_lateral_offset": {"low": "Tuck your elbow in", "high": "Elbow alignment is solid"},
-    "shoulder_level_diff": {"low": "Keep your shoulders level", "high": "Keep your shoulders level"},
+    "elbow_angle_release": {"low": "Extend your elbow fully at release — finish with your arm straight", "high": "Don't overextend your elbow — snap your wrist to finish the shot"},
+    "trunk_lean_release": {"low": "Keep your chest upright through the release — don't lean forward", "high": "You're falling backward — keep your torso centered over your hips at release"},
+    "knee_bend_load": {"low": "Bend your knees deeper before shooting — sit into your legs", "high": "Don't over-bend your knees — stay in an athletic stance"},
+    "hip_angle_load": {"low": "Hinge at your hips more — sit into your shot like sitting in a chair", "high": "You're sitting too deep — stay more upright at the set point"},
+    "heel_height_release": {"low": "Push off the balls of your feet at release — transfer leg power upward", "high": "You're jumping too high — focus on controlled lift, push energy into the shot"},
+    "wrist_height_release": {"low": "Release the ball higher — finish with your hand above your eyes", "high": "Release height is good — focus on other mechanics"},
+    "elbow_angle_load": {"low": "Bring the ball higher to your set point — elbow at forehead level", "high": "Compact your set point — keep your shooting elbow tighter to your body"},
+    "elbow_height_load": {"low": "Raise your shooting elbow higher at the set point — aim for eye level", "high": "Your elbow is too high at the set point — lower it slightly for comfort"},
+    "stance_width": {"low": "Widen your stance to shoulder width for a stable base", "high": "Narrow your stance to shoulder width — too wide limits your power transfer"},
+    "elbow_lateral_offset": {"low": "Tuck your shooting elbow in — align it under the ball", "high": "Elbow alignment is solid — keep it tucked"},
+    "shoulder_level_diff": {"low": "Your shooting shoulder is dropping — keep both shoulders level at release", "high": "Your shooting shoulder is rising too high — relax it to stay level"},
 }
 
 # Metric labels for display
@@ -209,7 +209,7 @@ OPTIMAL_VALUES = {
     "wrist_height_release": (0.9, 1.3),
     "knee_bend_load": (95, 115),
     "hip_angle_load": (120, 145),
-    "elbow_height_load": (0.8, 1.1),
+    "elbow_height_load": (0.6, 0.8),
     "heel_height_release": (0.05, 0.15),
     "trunk_lean_release": (-3, 3),
     "stance_width": (0.9, 1.2),
@@ -218,6 +218,30 @@ OPTIMAL_VALUES = {
 }
 
 ALL_METRICS = list(METRIC_LABELS.keys())
+
+# Metric reliability tiers — weight reflects measurement confidence and research backing
+# Tier 1 (Core): strong research, reliable 2D measurement
+# Tier 2 (Secondary): real research but optimal ranges approximated
+# Tier 3 (Supplementary): coaching convention, front-view only
+# Tier 4 (Motion): heuristic, noisy; dip_depth = 0.0 (style preference, never scored)
+METRIC_TIERS = {
+    "elbow_angle_load":      {"tier": 1, "weight": 1.0},
+    "elbow_angle_release":   {"tier": 1, "weight": 1.0},
+    "wrist_height_release":  {"tier": 1, "weight": 1.0},
+    "knee_bend_load":        {"tier": 1, "weight": 1.0},
+    "hip_angle_load":        {"tier": 2, "weight": 0.5},
+    "elbow_height_load":     {"tier": 2, "weight": 0.4},
+    "trunk_lean_release":    {"tier": 2, "weight": 0.5},
+    "heel_height_release":   {"tier": 2, "weight": 0.4},
+    "stance_width":          {"tier": 3, "weight": 0.2},
+    "shoulder_level_diff":   {"tier": 3, "weight": 0.2},
+    "elbow_lateral_offset":  {"tier": 3, "weight": 0.2},
+    "hitch_count":           {"tier": 4, "weight": 0.15},
+    "hitch_severity":        {"tier": 4, "weight": 0.1},
+    "motion_smoothness":     {"tier": 4, "weight": 0.1},
+    "pocket_lateral_sweep":  {"tier": 4, "weight": 0.1},
+    "dip_depth":             {"tier": 4, "weight": 0.0},
+}
 
 class ShotFingerprint(BaseModel):
     session_count: int
@@ -368,20 +392,27 @@ def _compute_fingerprint(user_id: str) -> dict:
     make_sig = calc_signature(makes) if len(makes) >= 3 else {}
     miss_sig = calc_signature(misses) if len(misses) >= 3 else {}
 
-    # Compute improvement areas
+    # Compute improvement areas (weighted by metric tier)
     improvement_areas = []
     for metric in ALL_METRICS:
         if metric not in make_sig or metric not in miss_sig:
             continue
+
+        metric_weight = METRIC_TIERS.get(metric, {}).get("weight", 0.1)
+        if metric_weight == 0.0:
+            continue  # Skip dip_depth and other zero-weight metrics
+
         make_avg = make_sig[metric]["avg"]
         miss_avg = miss_sig[metric]["avg"]
         delta = abs(make_avg - miss_avg)
 
         opt = OPTIMAL_VALUES.get(metric, (0, 1))
-        opt_span = max(abs(opt[1] - opt[0]), 0.01)
+        opt_span = abs(opt[1] - opt[0])
+        # Span floor prevents tiny-range metrics (shoulder_level_diff: 0.0-0.1) from exploding
+        effective_span = max(opt_span, 0.1) if opt_span < 1.0 else max(opt_span, 10.0)
 
         miss_freq = len(misses) / max(total_shots, 1)
-        raw_impact = (delta / opt_span) * miss_freq
+        raw_impact = (delta / effective_span) * miss_freq * metric_weight
 
         # Determine cue direction
         direction = "low" if miss_avg < make_avg else "high"
@@ -1056,6 +1087,7 @@ def _run_analysis(
         
         # Process video to find ALL shots
         import cv2
+        import numpy as np
         import time as _time
         cap = cv2.VideoCapture(video_path)
 
@@ -1067,8 +1099,19 @@ def _run_analysis(
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+        duration_seconds = total_frames / fps
         print(f"🎬 Video info: {total_frames} frames @ {fps:.1f} fps ({width}x{height})")
-        print(f"⏱️  Duration: {total_frames/fps:.1f} seconds")
+        print(f"⏱️  Duration: {duration_seconds:.1f} seconds")
+
+        MAX_DURATION_SECONDS = 195  # 3 min + 15s grace for encoding variance
+        if duration_seconds > MAX_DURATION_SECONDS:
+            cap.release()
+            os.unlink(video_path)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video is {duration_seconds:.0f}s — max allowed is 3 minutes. Please trim and re-upload.",
+            )
+
         print(f"🔍 Scanning for shots...\n")
 
         update_progress("detecting", 10, "Scanning for shots...",
@@ -1181,54 +1224,61 @@ This is a strict requirement — always return made=null when rim position is un
 
             if cam_angle == "side":
                 metrics_block = f"""Shot metrics (SIDE VIEW — angles are reliable):
-**PRIMARY METRICS:**
+
+**CORE MECHANICS** (these drive your form_rating — weight them ~70%):
 - Elbow at load: {shot_event.elbow_angle_load:.0f}° (optimal: 50-70°)
 - Elbow at release: {shot_event.elbow_angle_release:.0f}° (optimal: 130-165°)
-- Wrist height at release: {shot_event.wrist_height_release:.2f}
+- Wrist height at release: {shot_event.wrist_height_release:.2f} (optimal: 0.9-1.3)
 - Knee bend at load: {shot_event.knee_bend_load:.0f}° (optimal: 95-115°)
+
+**SECONDARY MECHANICS** (factor in, but don't let these outweigh core):
 - Hip angle at load: {shot_event.hip_angle_load:.0f}° (optimal: 120-145°)
-- Elbow height at load: {shot_event.elbow_height_load:.2f} (0=hip, 1=shoulder, optimal: 0.8-1.1)
+- Elbow height at load: {shot_event.elbow_height_load:.2f} (0=hip, 1=shoulder, optimal: 0.6-0.8)
 - Heel height at release: {shot_event.heel_height_release:.2f} (optimal: 0.05-0.15, higher = more lift)
 - Trunk lean at release: {shot_event.trunk_lean_release:.1f}° (optimal: -3 to 3°, negative = forward lean)
 
-**MOTION QUALITY METRICS:**
-- Hitch count: {shot_event.hitch_count} (optimal: 0 — any hitch means a pause/stutter in the upward motion)
-- Motion smoothness: {shot_event.motion_smoothness:.2f} (optimal: 1.0-1.3, higher = jerkier motion)
-- Pocket lateral sweep: {shot_event.pocket_lateral_sweep:.3f} (optimal: 0.0-0.05, higher = ball sweeps sideways to set point)
-- Dip depth: {shot_event.dip_depth:.3f} (0 = no dip below hip, higher = deeper dip)
+**MOTION OBSERVATIONS** (only mention if clearly problematic):
+- Hitch count: {shot_event.hitch_count} (only flag if >= 2)
+- Motion smoothness: {shot_event.motion_smoothness:.2f} (only flag if > 1.5)
+- Pocket lateral sweep: {shot_event.pocket_lateral_sweep:.3f} (only flag if > 0.08)
+- Dip depth: {shot_event.dip_depth:.3f} — STYLE PREFERENCE — do NOT score as good/bad
 
 From this side view, focus on: shot sequencing (legs-to-arms), follow-through, arc, balance, release timing, and shooting pocket path.
-Look for: hitches/stutters in the upward motion, how deep the ball dips before coming up, and whether the pocket path is straight.
 Do NOT comment on elbow alignment or guide hand — those are not visible from the side."""
 
             elif cam_angle == "front":
                 metrics_block = f"""Shot metrics (FRONT VIEW — angle measurements are UNRELIABLE from this view):
-- Elbow at load: {shot_event.elbow_angle_load:.0f}° (NOT reliable from front — do not comment on specific angle values)
+
+**CORE MECHANICS** (NOT reliable from front — do not comment on specific angle values):
+- Elbow at load: {shot_event.elbow_angle_load:.0f}° (NOT reliable from front)
 - Elbow at release: {shot_event.elbow_angle_release:.0f}° (NOT reliable from front)
 - Wrist height at release: {shot_event.wrist_height_release:.2f}
 - Knee bend at load: {shot_event.knee_bend_load:.0f}° (NOT reliable from front)
 
-**SUPPLEMENTARY METRICS (front-view specific):**
+**FRONT-VIEW MECHANICS** (meaningful from this angle — weight these higher):
 - Stance width: {shot_event.stance_width:.2f} (ratio of ankle spread to shoulder width, optimal: 0.9-1.2)
 - Shoulder level diff: {shot_event.shoulder_level_diff:.2f} (positive = shooting shoulder higher, optimal: 0.0-0.1)
 - Elbow lateral offset: {shot_event.elbow_lateral_offset:.2f} (0 = tucked, optimal: 0.0-0.15)
 
-**MOTION QUALITY METRICS:**
-- Hitch count: {shot_event.hitch_count} (optimal: 0)
-- Motion smoothness: {shot_event.motion_smoothness:.2f} (optimal: 1.0-1.3)
-- Pocket lateral sweep: {shot_event.pocket_lateral_sweep:.3f} (optimal: 0.0-0.05)
-- Dip depth: {shot_event.dip_depth:.3f} (0 = no dip below hip)
+**MOTION OBSERVATIONS** (only mention if clearly problematic):
+- Hitch count: {shot_event.hitch_count} (only flag if >= 2)
+- Motion smoothness: {shot_event.motion_smoothness:.2f} (only flag if > 1.5)
+- Pocket lateral sweep: {shot_event.pocket_lateral_sweep:.3f} (only flag if > 0.08)
+- Dip depth: {shot_event.dip_depth:.3f} — STYLE PREFERENCE — do NOT score as good/bad
 
 From this front view, focus on: elbow alignment (tucked vs flared), ball path (straight vs drifting), stance width, shoulder symmetry, landing position, off-hand/guide hand interference, and footwork pattern.
-Look for: off-hand thumb coming forward during release, footwork type (1-step, 2-step, shuffle, or jump stop), and whether the pocket path sweeps laterally.
 Do NOT comment on specific angle values — they are inaccurate from the front."""
 
             else:  # angled
-                metrics_block = f"""Shot metrics (ANGLED VIEW — angles are approximate):
+                metrics_block = f"""Shot metrics (ANGLED VIEW — all measurements are approximate):
+
+**CORE MECHANICS** (approximate — weight them ~70% but note reduced confidence):
 - Elbow at load: {shot_event.elbow_angle_load:.0f}° (approximate)
 - Elbow at release: {shot_event.elbow_angle_release:.0f}° (approximate)
-- Wrist height at release: {shot_event.wrist_height_release:.2f}
+- Wrist height at release: {shot_event.wrist_height_release:.2f} (approximate)
 - Knee bend at load: {shot_event.knee_bend_load:.0f}° (approximate)
+
+**SECONDARY MECHANICS** (approximate):
 - Hip angle at load: {shot_event.hip_angle_load:.0f}° (approximate, optimal: 120-145°)
 - Elbow height at load: {shot_event.elbow_height_load:.2f} (approximate)
 - Heel height at release: {shot_event.heel_height_release:.2f} (approximate)
@@ -1237,14 +1287,14 @@ Do NOT comment on specific angle values — they are inaccurate from the front."
 - Shoulder level diff: {shot_event.shoulder_level_diff:.2f} (approximate)
 - Elbow lateral offset: {shot_event.elbow_lateral_offset:.2f} (approximate)
 
-**MOTION QUALITY METRICS:**
-- Hitch count: {shot_event.hitch_count} (optimal: 0)
-- Motion smoothness: {shot_event.motion_smoothness:.2f} (optimal: 1.0-1.3)
-- Pocket lateral sweep: {shot_event.pocket_lateral_sweep:.3f} (optimal: 0.0-0.05)
-- Dip depth: {shot_event.dip_depth:.3f} (0 = no dip below hip)
+**MOTION OBSERVATIONS** (only mention if clearly problematic):
+- Hitch count: {shot_event.hitch_count} (only flag if >= 2)
+- Motion smoothness: {shot_event.motion_smoothness:.2f} (only flag if > 1.5)
+- Pocket lateral sweep: {shot_event.pocket_lateral_sweep:.3f} (only flag if > 0.08)
+- Dip depth: {shot_event.dip_depth:.3f} — STYLE PREFERENCE — do NOT score as good/bad
 
-From this angled view, you can assess both form mechanics and alignment, but angle measurements are approximate.
-Look for: footwork pattern, off-hand interference, shooting pocket path, hitches in the motion, and follow-through quality. Comment on what you can clearly observe."""
+From this angled view, you can assess both form mechanics and alignment, but all measurements are approximate.
+Comment on what you can clearly observe."""
 
             # Build player context section
             player_context = player_profile.to_prompt_section() if player_profile.skill_level != "intermediate" or player_profile.working_on or player_profile.height_inches else ""
@@ -1287,6 +1337,11 @@ Camera angle: {cam_angle}
 
 {make_miss_instruction}
 {fingerprint_context}
+SCORING RULES:
+- form_rating should be ~70% driven by CORE MECHANICS. If all 4 core metrics are in optimal range, minimum rating is 6.
+- Feedback should address the SINGLE biggest fixable issue, not multiple minor things.
+- Never penalize or praise dip depth — it is a style preference.
+
 Provide BRIEF analysis in JSON:
 {{
     "made": true/false/null,
@@ -1298,12 +1353,11 @@ Provide BRIEF analysis in JSON:
 }}
 """
 
-            # Encode form frames as image parts
+            # Form frames are already JPEG bytes from the buffer
             content_for_gemini = [prompt]
-            for label, frame_img in shot_event.frames:
-                _, buffer = cv2.imencode('.jpg', frame_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            for label, jpg_bytes in shot_event.frames:
                 content_for_gemini.append(
-                    types.Part.from_bytes(data=bytes(buffer), mime_type="image/jpeg")
+                    types.Part.from_bytes(data=jpg_bytes, mime_type="image/jpeg")
                 )
 
             # Add outcome frames for make/miss determination
@@ -1470,7 +1524,8 @@ Provide BRIEF analysis in JSON:
             # Create thumbnail with skeleton overlay
             # Use the release frame (index 14 in 20-frame layout) for thumbnail
             release_frame_idx = next((i for i, (label, _) in enumerate(shot_event.frames) if 'Release' in label), len(shot_event.frames) - 1)
-            rel_frame = shot_event.frames[release_frame_idx][1]
+            rel_jpg = shot_event.frames[release_frame_idx][1]
+            rel_frame = cv2.imdecode(np.frombuffer(rel_jpg, np.uint8), cv2.IMREAD_COLOR)
             if shot_landmarks and shot_visibility:
                 rel_frame = draw_skeleton(rel_frame, shot_landmarks, shot_visibility)
 

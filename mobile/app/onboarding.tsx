@@ -57,12 +57,11 @@ const DISTANCES = [
 ];
 
 export default function OnboardingScreen() {
-  const { refreshProfile, forceClearSession } = useAuth();
+  const { user, refreshProfile, forceClearSession } = useAuth();
   const [loading, setLoading] = useState(false);
   const [step, setStep] = useState(1);
 
   // Form data
-  const [fullName, setFullName] = useState('');
   const [skillLevel, setSkillLevel] = useState<string | null>(null);
   const [shootingHand, setShootingHand] = useState<'left' | 'right'>('right');
   const [heightFeet, setHeightFeet] = useState('');
@@ -83,8 +82,8 @@ export default function OnboardingScreen() {
 
   const handleNext = () => {
     if (step === 1) {
-      if (!fullName || !skillLevel) {
-        Alert.alert('Required', 'Please fill in your name and skill level');
+      if (!skillLevel) {
+        Alert.alert('Required', 'Please select your skill level');
         return;
       }
     } else if (step === 2) {
@@ -109,7 +108,7 @@ export default function OnboardingScreen() {
         : null;
 
       await db.updateProfile({
-        full_name: fullName,
+        full_name: user?.user_metadata?.full_name || '',
         skill_level: skillLevel as any,
         shooting_hand: shootingHand,
         height_inches: heightInchesTotal,
@@ -164,23 +163,9 @@ export default function OnboardingScreen() {
               contentContainerStyle={styles.content}
               keyboardShouldPersistTaps="handled"
             >
-              <Text style={styles.title}>Welcome to FormCheck</Text>
+              <Text style={styles.title}>Hey, {user?.user_metadata?.full_name?.split(' ')[0] || 'there'}!</Text>
               <Text style={styles.subtitle}>Let's set up your profile</Text>
               <Text style={styles.stepIndicator}>Step 1 of 3</Text>
-
-              <View style={styles.section}>
-                <Text style={styles.label}>Your Name</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="Enter your name"
-                  placeholderTextColor="#666"
-                  value={fullName}
-                  onChangeText={setFullName}
-                  autoCapitalize="words"
-                  autoComplete="name"
-                  returnKeyType="done"
-                />
-              </View>
 
               <View style={styles.section}>
                 <Text style={styles.label}>Skill Level</Text>

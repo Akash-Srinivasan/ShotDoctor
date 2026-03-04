@@ -26,50 +26,53 @@ export const METRIC_LABELS: Record<string, string> = {
 
 export const CUE_TEMPLATES: Record<string, { low: string; high: string }> = {
   elbow_angle_release: {
-    low: 'Extend your elbow fully on release',
-    high: "Don't overextend — snap the wrist instead",
+    low: 'Extend your elbow fully at release — finish with your arm straight',
+    high: "Don't overextend your elbow — snap your wrist to finish the shot",
   },
   trunk_lean_release: {
-    low: 'Stay tall through your release',
-    high: 'Lean into your shot slightly',
+    low: "Keep your chest upright through the release — don't lean forward",
+    high: "You're falling backward — keep your torso centered over your hips at release",
   },
   knee_bend_load: {
-    low: 'Bend your knees more at the set point',
-    high: "Don't over-bend — stay athletic",
+    low: 'Bend your knees deeper before shooting — sit into your legs',
+    high: "Don't over-bend your knees — stay in an athletic stance",
   },
   hip_angle_load: {
-    low: 'Sit into your shot more',
-    high: 'Stay more upright at the set point',
+    low: 'Hinge at your hips more — sit into your shot like sitting in a chair',
+    high: "You're sitting too deep — stay more upright at the set point",
   },
   heel_height_release: {
-    low: 'Get up on your toes at release',
-    high: "Stay grounded — don't jump too much",
+    low: 'Push off the balls of your feet at release — transfer leg power upward',
+    high: "You're jumping too high — focus on controlled lift, push energy into the shot",
   },
   wrist_height_release: {
-    low: 'Get the ball higher at release',
-    high: 'Release point is good — focus elsewhere',
+    low: 'Release the ball higher — finish with your hand above your eyes',
+    high: 'Release height is good — focus on other mechanics',
   },
   elbow_angle_load: {
-    low: 'Bring the ball up higher to your set point',
-    high: 'Keep a tighter set point',
+    low: 'Bring the ball higher to your set point — elbow at forehead level',
+    high: 'Compact your set point — keep your shooting elbow tighter to your body',
   },
   elbow_height_load: {
-    low: 'Raise your elbow higher at the set point',
-    high: 'Elbow height is good',
+    low: 'Raise your shooting elbow higher at the set point — aim for eye level',
+    high: 'Your elbow is too high at the set point — lower it slightly for comfort',
   },
   stance_width: {
-    low: 'Widen your stance slightly',
-    high: 'Narrow your stance to shoulder width',
+    low: 'Widen your stance to shoulder width for a stable base',
+    high: 'Narrow your stance to shoulder width — too wide limits your power transfer',
   },
   elbow_lateral_offset: {
-    low: 'Tuck your elbow in',
-    high: 'Elbow alignment is solid',
+    low: 'Tuck your shooting elbow in — align it under the ball',
+    high: 'Elbow alignment is solid — keep it tucked',
   },
   shoulder_level_diff: {
-    low: 'Keep your shoulders level',
-    high: 'Keep your shoulders level',
+    low: 'Your shooting shoulder is dropping — keep both shoulders level at release',
+    high: 'Your shooting shoulder is rising too high — relax it to stay level',
   },
 };
+
+// Metrics excluded from shot-to-signature comparison (style preferences, not scored)
+export const EXCLUDED_METRICS = new Set(['dip_depth']);
 
 // ============================================================================
 // Types
@@ -105,6 +108,7 @@ export function compareShotToSignature(
   const deviations: MetricDeviation[] = [];
 
   for (const metric in makeSignature) {
+    if (EXCLUDED_METRICS.has(metric)) continue;
     const shotValue = shot[metric];
     if (shotValue === null || shotValue === undefined) continue;
 

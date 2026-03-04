@@ -120,31 +120,39 @@ async function handleResponse<T>(response: Response): Promise<T> {
  * Test connection to the API server
  */
 export async function testConnection(): Promise<boolean> {
-  try {
-    const response = await fetchWithTimeout(
-      `${API_URL}/health`,
-      { method: 'GET' },
-      5000 // 5 second timeout for health check
-    );
-    
-    const data = await handleResponse<HealthResponse>(response);
-    
-    // Check that required modules are available
-    if (!data.modules_available) {
-      console.warn('API connected but modules not available');
-      return false;
+  // Try up to 3 times to handle Railway cold starts (can take 10-30s)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetchWithTimeout(
+        `${API_URL}/health`,
+        { method: 'GET' },
+        15000 // 15 second timeout (Railway cold start can be slow)
+      );
+
+      const data = await handleResponse<HealthResponse>(response);
+
+      // Check that required modules are available
+      if (!data.modules_available) {
+        console.warn('API connected but modules not available');
+        return false;
+      }
+
+      if (!data.gemini_configured) {
+        console.warn('API connected but Gemini not configured');
+        // Still return true - API is reachable, just AI won't work
+      }
+
+      return true;
+    } catch (error) {
+      console.warn(`API connection attempt ${attempt + 1}/3 failed:`, error);
+      if (attempt < 2) {
+        // Wait before retrying — gives Railway time to wake up
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
     }
-    
-    if (!data.gemini_configured) {
-      console.warn('API connected but Gemini not configured');
-      // Still return true - API is reachable, just AI won't work
-    }
-    
-    return true;
-  } catch (error) {
-    console.error('API connection test failed:', error);
-    return false;
   }
+  console.error('API connection failed after 3 attempts');
+  return false;
 }
 
 /**

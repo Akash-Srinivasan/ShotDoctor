@@ -1,7 +1,6 @@
 # ShotDoc
 
-An AI-powered basketball shooting analysis app that watches your practice sessions, automatically detects every shot, grades your form, and tells you exactly what to fix — without you touching a button.
-
+Hey, I created this project as someone new to AI-assisted coding, App dev, and deploying real code to users (i'm also not particularly good at shooting a basketball). I've always taken videos of my shooting form and wished there was a central hub, where I could see my shooting trends and improvement areas. I built this with the assistence of claude code to solve that exact problem, but it's definitely still a work in progress. I plan to publish this to the App store and work on new features including a tutorial section, shooting charts, and better make/miss detection. Feel free to tinker with the approach or suggest ideas for improvement! 
 > **Status:** In active development. Backend deployed on Railway. iOS app in TestFlight beta.
 
 ## Screenshots

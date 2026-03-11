@@ -7,6 +7,8 @@ Processes ALL shots in a video and returns session summary
 import os
 import sys
 import time
+import warnings
+warnings.filterwarnings("ignore", message="Could not initialize NNPACK")
 from pathlib import Path
 from typing import Optional, List
 import uvicorn
@@ -49,6 +51,22 @@ try:
 except ImportError as e:
     print(f"⚠️  Warning: Could not import ball tracking: {e}")
     BALL_TRACKING_AVAILABLE = False
+
+# Rim detection for auto-calibrating rim size
+try:
+    from rim_detector import RimDetector, RimDetection
+    RIM_DETECTOR_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  Warning: Could not import rim detector: {e}")
+    RIM_DETECTOR_AVAILABLE = False
+
+# Rim-area classifier for make/miss binary classification
+try:
+    from rim_area_classifier import RimAreaClassifier
+    RIM_CLASSIFIER_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  Warning: Could not import rim area classifier: {e}")
+    RIM_CLASSIFIER_AVAILABLE = False
 
 # Initialize FastAPI
 app = FastAPI(
@@ -104,6 +122,21 @@ if BALL_TRACKING_AVAILABLE:
     except Exception as e:
         print(f"⚠️  Ball tracker pre-load failed: {e}")
         _shared_ball_tracker = None
+
+# Pre-load rim-area classifier once at startup
+_shared_rim_classifier = None
+if RIM_CLASSIFIER_AVAILABLE:
+    try:
+        _shared_rim_classifier = RimAreaClassifier()
+        if _shared_rim_classifier.enabled:
+            _shared_rim_classifier.warm_up()
+            print("✓ Rim area classifier pre-loaded and warmed up")
+        else:
+            _shared_rim_classifier = None
+            print("⚠️  Rim classifier model not found — classifier disabled")
+    except Exception as e:
+        print(f"⚠️  Rim classifier pre-load failed: {e}")
+        _shared_rim_classifier = None
 
 # Models
 class ShotFrame(BaseModel):
@@ -185,6 +218,42 @@ CUE_TEMPLATES = {
     "stance_width": {"low": "Widen your stance to shoulder width for a stable base", "high": "Narrow your stance to shoulder width — too wide limits your power transfer"},
     "elbow_lateral_offset": {"low": "Tuck your shooting elbow in — align it under the ball", "high": "Elbow alignment is solid — keep it tucked"},
     "shoulder_level_diff": {"low": "Your shooting shoulder is dropping — keep both shoulders level at release", "high": "Your shooting shoulder is rising too high — relax it to stay level"},
+}
+
+# Quick cue dictionary: maps key_issue values to standardized 2-4 word cues
+QUICK_CUE_MAP = {
+    # Elbow
+    "elbow not fully extended": "Extend & snap",
+    "elbow flare": "Tuck your elbow",
+    "elbow too low": "Elbow up higher",
+    "elbow dropping": "Keep elbow high",
+    # Wrist / Release
+    "no wrist snap": "Snap your wrist",
+    "flat release": "More arc",
+    "release too low": "Release higher",
+    "release too late": "Earlier release",
+    "release too early": "Hold longer",
+    # Legs / Base
+    "not enough knee bend": "Bend your knees",
+    "too much knee bend": "Less knee bend",
+    "stance too narrow": "Widen your stance",
+    "stance too wide": "Narrow your stance",
+    "no leg power": "Use your legs",
+    "off balance": "Stay balanced",
+    # Trunk / Core
+    "leaning forward": "Stay upright",
+    "leaning backward": "Center your weight",
+    "trunk rotation": "Square your hips",
+    # Guide hand
+    "guide hand interference": "Quiet guide hand",
+    "thumb flick": "Still guide hand",
+    # Follow through
+    "no follow through": "Hold your follow",
+    "short follow through": "Reach & hold",
+    # General
+    "inconsistent": "Same shot every time",
+    "rushed": "Slow it down",
+    "none": "Nice form!",
 }
 
 # Metric labels for display
@@ -277,8 +346,11 @@ def _persist_session_results(
     try:
         persist_start = time.time()
 
-        # 1. Update session with final stats
-        session_update = {
+        # 1. Upsert session — client may have deleted it during a timeout/error race
+        session_data = {
+            "id": session_id,
+            "user_id": user_id,
+            "started_at": started_at,
             "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
             "shot_count": session_summary.total_shots,
             "make_count": session_summary.shots_made,
@@ -289,8 +361,8 @@ def _persist_session_results(
             "drill_suggestions": session_summary.drill_suggestions,
         }
 
-        _supabase_client.table("sessions").update(session_update).eq("id", session_id).execute()
-        print(f"✓ Server: Updated session {session_id}")
+        _supabase_client.table("sessions").upsert(session_data).execute()
+        print(f"✓ Server: Upserted session {session_id}")
 
         # 2. Batch insert all shots
         shots_data = []
@@ -666,7 +738,7 @@ def _find_longest_clean_segment(trajectory, max_jump_px=80):
     return max(segments, key=lambda s: len(s))
 
 
-def analyze_make_miss(trajectory, rim_x, rim_y, frame_width, frame_height, camera_angle="side", skip_cleaning=False):
+def analyze_make_miss(trajectory, rim_x, rim_y, frame_width, frame_height, camera_angle="side", skip_cleaning=False, rim_radius_px=None):
     """
     Determine make/miss from ball flight trajectory relative to user-calibrated rim.
 
@@ -686,6 +758,7 @@ def analyze_make_miss(trajectory, rim_x, rim_y, frame_width, frame_height, camer
         rim_x, rim_y: Normalized 0-1 rim position from user calibration
         frame_width, frame_height: Video dimensions in pixels
         camera_angle: "side", "front", or "angled"
+        rim_radius_px: Auto-detected rim radius in pixels (from RimDetector), or None for 2% heuristic
 
     Returns:
         dict with keys: made (bool|None), confidence (float), miss_type (str|None)
@@ -703,8 +776,8 @@ def analyze_make_miss(trajectory, rim_x, rim_y, frame_width, frame_height, camer
     rim_px = int(rim_x * frame_width)
     rim_py = int(rim_y * frame_height)
 
-    # Estimate rim radius as ~2% of frame width
-    rim_radius = int(frame_width * 0.02)
+    # Use auto-detected rim radius if available, otherwise fall back to 2% heuristic
+    rim_radius = rim_radius_px if rim_radius_px else int(frame_width * 0.02)
 
     # --- Step 1: Optionally clean trajectory by finding best contiguous segment ---
     raw_len = len(trajectory)
@@ -881,8 +954,17 @@ def analyze_make_miss(trajectory, rim_x, rim_y, frame_width, frame_height, camer
         print(f"      ✅ MADE via close+descending (conf={confidence:.0%})")
         return {"made": True, "confidence": confidence, "miss_type": None}
 
-    # Near the rim but didn't go through — likely a miss
+    # Near the rim but didn't go through
     if min_dist < near_threshold:
+        # If the ball was still ascending at its closest tracked point, the tracker
+        # likely lost it before it reached the rim (common for front-view shots where
+        # ball is occluded by rim/net at the critical moment). Return unclear so
+        # Gemini gets the final call rather than biasing it toward miss.
+        if not descending_near_rim and min_dist > make_threshold:
+            print(f"      ❓ UNCLEAR: near rim but ascending — tracker likely lost ball before apex "
+                  f"(dist={min_dist:.0f}px, descending={descending_near_rim})")
+            return {"made": None, "confidence": 0.3 * angle_mult, "miss_type": None}
+
         if abs(dx) > abs(dy):
             lr = "left" if dx < 0 else "right"
             sl = "short" if dy > 0 else "long"
@@ -1103,6 +1185,172 @@ def _run_analysis(
         print(f"🎬 Video info: {total_frames} frames @ {fps:.1f} fps ({width}x{height})")
         print(f"⏱️  Duration: {duration_seconds:.1f} seconds")
 
+        # --- Rim auto-detection from early frames ---
+        # Sample frames from the first 2 seconds to detect rim size/position
+        detected_rim_radius_px = None
+        detected_rim_bbox = None  # (x, y, w, h) in pixels
+        if RIM_DETECTOR_AVAILABLE:
+            try:
+                rim_det = RimDetector(method="hough")
+                sample_frames_count = min(8, int(fps * 2))  # up to 8 frames from first 2s
+                sample_interval = max(1, int(fps * 2) // sample_frames_count)
+                rim_detections = []
+
+                # If user marked a rim, convert to pixel coords for filtering
+                user_rim_px = None
+                if rim_x is not None and rim_y is not None:
+                    user_rim_px = (int(rim_x * width), int(rim_y * height))
+
+                debug_frame = None
+                debug_all_dets = []  # all circles found on last frame
+                debug_selected = None  # the one we picked
+
+                for i in range(sample_frames_count):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, i * sample_interval)
+                    ret_sample, sample_frame = cap.read()
+                    if not ret_sample:
+                        break
+                    if user_rim_px:
+                        # Cropped search around user mark + orange color scoring
+                        near_dets = rim_det.detect_near_point(sample_frame, user_rim_px)
+                        # Also get full-frame detections for debug visualization
+                        all_dets = rim_det.detect_all(sample_frame)
+                        if all_dets:
+                            debug_frame = sample_frame.copy()
+                            debug_all_dets = all_dets
+                        if near_dets:
+                            # Best = highest orange score (already sorted)
+                            best = near_dets[0]
+                            rim_detections.append(best)
+                            debug_selected = best
+                            if debug_frame is None:
+                                debug_frame = sample_frame.copy()
+                    else:
+                        all_dets = rim_det.detect_all(sample_frame)
+                        if all_dets:
+                            debug_frame = sample_frame.copy()
+                            debug_all_dets = all_dets
+                            best = max(all_dets, key=lambda d: d.confidence)
+                            rim_detections.append(best)
+                            debug_selected = best
+
+                # Save debug frame with circles drawn to Supabase
+                if debug_frame is not None and _supabase_client:
+                    try:
+                        vis = debug_frame.copy()
+                        # Draw cropped search region as blue rectangle
+                        if user_rim_px:
+                            ux, uy = user_rim_px
+                            crop_hw = int(width * 0.15)
+                            crop_hh = int(height * 0.15)
+                            cv2.rectangle(vis,
+                                          (max(0, ux - crop_hw), max(0, uy - crop_hh)),
+                                          (min(width, ux + crop_hw), min(height, uy + crop_hh)),
+                                          (255, 200, 0), 2)
+                        # Draw ALL detected circles (full-frame Hough) in gray
+                        for d in debug_all_dets:
+                            cv2.circle(vis, d.center, d.width // 2, (150, 150, 150), 2)
+                            cv2.putText(vis, f"{d.width}px", (d.center[0] - 20, d.center[1] - d.width // 2 - 8),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+                        # Draw SELECTED circle in green with orange score
+                        if debug_selected:
+                            # Draw ellipse for color_contour, circle for hough
+                            if debug_selected.method == 'color_contour':
+                                # Draw bounding ellipse
+                                ecx, ecy = debug_selected.center
+                                axes = (debug_selected.width // 2, debug_selected.height // 2)
+                                cv2.ellipse(vis, (ecx, ecy), axes, 0, 0, 360, (0, 255, 0), 3)
+                            else:
+                                cv2.circle(vis, debug_selected.center, debug_selected.width // 2, (0, 255, 0), 3)
+                            label = f"SELECTED: {debug_selected.width}x{debug_selected.height}px ({debug_selected.method})"
+                            if debug_selected.method == 'color_contour':
+                                label += f" orange={debug_selected.confidence:.0%}"
+                            elif debug_selected.method == 'hough_fallback':
+                                label += " (no color match)"
+                            cv2.putText(vis, label,
+                                        (debug_selected.center[0] - 80, debug_selected.center[1] - debug_selected.width // 2 - 12),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        # Draw user-marked rim position as red crosshair
+                        if user_rim_px:
+                            ux, uy = user_rim_px
+                            cv2.drawMarker(vis, (ux, uy), (0, 0, 255), cv2.MARKER_CROSS, 30, 3)
+                            cv2.putText(vis, "USER", (ux + 15, uy - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                        # Add summary text
+                        cv2.putText(vis, f"Full-frame circles: {len(debug_all_dets)} | Cropped detections: {len(rim_detections)}/{sample_frames_count}",
+                                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                        _, dbg_buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                        sid = session_id or "nosession"
+                        _supabase_client.storage.from_("rim-training-data").upload(
+                            f"debug/{sid}_rim_detection.jpg", bytes(dbg_buf),
+                            {"content-type": "image/jpeg", "upsert": "true"}
+                        )
+                        print(f"🔍 Rim debug frame saved to rim-training-data/debug/{sid}_rim_detection.jpg")
+                    except Exception as dbg_err:
+                        print(f"⚠️  Rim debug save failed: {dbg_err}")
+
+                # Reset video to beginning
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+                if len(rim_detections) >= 3:
+                    # Take median width as calibrated rim size
+                    widths = sorted([d.width for d in rim_detections])
+                    median_width = widths[len(widths) // 2]
+
+                    # Sanity check: rim should be between 3% and 20% of frame width
+                    # (basketball rim ~18in, typical phone filming distance 10-20ft)
+                    # Upper bound 20% covers close-up portrait-mode recordings
+                    min_rim = int(width * 0.03)
+                    max_rim = int(width * 0.20)
+
+                    if median_width < min_rim or median_width > max_rim:
+                        print(f"⚠️  Rim detection rejected: {median_width}px width is outside "
+                              f"plausible range ({min_rim}-{max_rim}px) — using 2% heuristic")
+                    else:
+                        # Also check consistency: if widths vary wildly, detection is unreliable
+                        width_spread = widths[-1] - widths[0]
+                        if width_spread > median_width * 0.5:
+                            print(f"⚠️  Rim detection inconsistent: widths range {widths[0]}-{widths[-1]}px "
+                                  f"(spread {width_spread}px > 50% of median) — using 2% heuristic")
+                        else:
+                            detected_rim_radius_px = median_width // 2
+
+                            # Take median center as detected rim position
+                            centers_x = sorted([d.center[0] for d in rim_detections])
+                            centers_y = sorted([d.center[1] for d in rim_detections])
+                            median_cx = centers_x[len(centers_x) // 2]
+                            median_cy = centers_y[len(centers_y) // 2]
+
+                            detected_rim_bbox = (
+                                median_cx - detected_rim_radius_px,
+                                median_cy - detected_rim_radius_px,
+                                median_width,
+                                median_width,
+                            )
+
+                            old_heuristic = int(width * 0.02)
+                            det_method = rim_detections[0].method if rim_detections else "unknown"
+                            avg_orange = sum(d.confidence for d in rim_detections) / len(rim_detections) if det_method == 'color_contour' else None
+                            orange_str = f", orange={avg_orange:.0%}" if avg_orange is not None else ""
+                            print(f"🎯 Rim auto-detected: center=({median_cx}, {median_cy}), "
+                                  f"width={median_width}px, radius={detected_rim_radius_px}px "
+                                  f"({len(rim_detections)}/{sample_frames_count} frames agreed, "
+                                  f"method={det_method}, spread={width_spread}px{orange_str})")
+                            print(f"🎯 Rim radius: {detected_rim_radius_px}px (auto) vs {old_heuristic}px (old 2% heuristic) — "
+                                  f"{'↑' if detected_rim_radius_px > old_heuristic else '↓'}{abs(detected_rim_radius_px - old_heuristic)}px difference")
+
+                            # Only use auto-detected center if user did NOT provide rim_x/rim_y
+                            if rim_x is None or rim_y is None:
+                                rim_x = median_cx / width
+                                rim_y = median_cy / height
+                                print(f"🎯 Using auto-detected rim position: ({rim_x:.3f}, {rim_y:.3f})")
+                else:
+                    print(f"⚠️  Rim detection inconclusive ({len(rim_detections)}/{sample_frames_count} frames) — using 2% heuristic")
+            except Exception as rim_err:
+                print(f"⚠️  Rim detection failed: {rim_err} — using 2% heuristic")
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
         MAX_DURATION_SECONDS = 195  # 3 min + 15s grace for encoding variance
         if duration_seconds > MAX_DURATION_SECONDS:
             cap.release()
@@ -1135,7 +1383,10 @@ def _run_analysis(
         active_outcome_captures = []  # [(shot_idx, start_frame, end_frame)]
 
         from concurrent.futures import ThreadPoolExecutor
-        gemini_executor = ThreadPoolExecutor(max_workers=3)
+        # Allow up to 10 concurrent Gemini calls (one per shot).
+        # Gemini calls are pure network I/O so threads parallelize perfectly.
+        # Real ceiling is API rate limit — Gemini 2.0 Flash paid tier handles this easily.
+        gemini_executor = ThreadPoolExecutor(max_workers=10)
 
         def _select_outcome_frames(raw_outcomes, rim_x, rim_y, fw, fh):
             """Return all outcome frames for Gemini. No filtering, no cropping.
@@ -1147,7 +1398,7 @@ def _run_analysis(
             """
             if not raw_outcomes:
                 return []
-            return [(img, frame_num) for img, _, frame_num in raw_outcomes]
+            return [(img, frame_num) for img, _, frame_num, *_ in raw_outcomes]
 
         # Collect strategy results per shot for session-level summary
         _strategy_log = []  # [(shot_idx, strat_a, strat_b, strat_c, strat_d, strat_e, strat_f)]
@@ -1179,12 +1430,12 @@ def _run_analysis(
                         if len(trajectory) >= 2:
                             cam_angle = shot_event.camera_angle or "side"
                             # Raw trajectory is PRIMARY (89% accuracy on side view)
-                            traj_result = analyze_make_miss(trajectory, rim_x, rim_y, width, height, camera_angle=cam_angle, skip_cleaning=True)
+                            traj_result = analyze_make_miss(trajectory, rim_x, rim_y, width, height, camera_angle=cam_angle, skip_cleaning=True, rim_radius_px=detected_rim_radius_px)
                             made_str = "MADE" if traj_result["made"] else ("MISSED" if traj_result["made"] is False else "UNCLEAR")
                             print(f"   🎯 Trajectory (raw): {made_str} (confidence: {traj_result['confidence']:.0%})"
                                   + (f" [{traj_result['miss_type']}]" if traj_result.get('miss_type') else ""))
                             # Cleaned trajectory for comparison logging only
-                            traj_result_clean = analyze_make_miss(trajectory, rim_x, rim_y, width, height, camera_angle=cam_angle, skip_cleaning=False)
+                            traj_result_clean = analyze_make_miss(trajectory, rim_x, rim_y, width, height, camera_angle=cam_angle, skip_cleaning=False, rim_radius_px=detected_rim_radius_px)
                         else:
                             print(f"   ⚠️ Trajectory too short ({len(trajectory)} points), skipping analysis")
                     elif best_idx is not None:
@@ -1193,6 +1444,46 @@ def _run_analysis(
                         print(f"   ⚠️ No trajectory match found")
                 else:
                     print(f"   ⚠️ No trajectories or releases to match against")
+
+            # Rim-area classifier: crop outcome frames around rim and classify
+            classifier_result = None
+            if _shared_rim_classifier and rim_position_available and outcome_frames:
+                try:
+                    rim_crop_cx = int(rim_x * width)
+                    rim_crop_cy = int(rim_y * height)
+                    # Use detected rim bbox for crop size, or 2x the 2% heuristic
+                    crop_radius = detected_rim_radius_px * 2 if detected_rim_radius_px else int(width * 0.04)
+
+                    crops = []
+                    for outcome_img, outcome_frame_num in outcome_frames:
+                        oh, ow = outcome_img.shape[:2]
+                        # Scale rim position to outcome frame size (outcome frames are resized to 640px wide)
+                        scale_x = ow / width
+                        scale_y = oh / height
+                        cx = int(rim_crop_cx * scale_x)
+                        cy = int(rim_crop_cy * scale_y)
+                        cr = int(crop_radius * scale_x)
+
+                        x1 = max(0, cx - cr)
+                        y1 = max(0, cy - cr)
+                        x2 = min(ow, cx + cr)
+                        y2 = min(oh, cy + cr)
+
+                        if x2 - x1 > 10 and y2 - y1 > 10:
+                            crop = outcome_img[y1:y2, x1:x2]
+                            crops.append(crop)
+
+                    if crops:
+                        classifier_result = _shared_rim_classifier.classify_sequence(crops)
+                        cls_made = classifier_result.get("made")
+                        cls_conf = classifier_result.get("confidence", 0)
+                        cls_through = classifier_result.get("through_count", 0)
+                        cls_total = classifier_result.get("total_frames", 0)
+                        cls_str = "MADE" if cls_made is True else ("MISSED" if cls_made is False else "UNCLEAR")
+                        print(f"   🔬 Rim classifier: {cls_str} (conf={cls_conf:.0%}, "
+                              f"through={cls_through}/{cls_total} frames)")
+                except Exception as cls_err:
+                    print(f"   ⚠️ Rim classifier error: {cls_err}")
 
             # Build Gemini prompt
             if traj_result and traj_result["confidence"] >= 0.5 and traj_result["made"] is not None:
@@ -1348,7 +1639,7 @@ Provide BRIEF analysis in JSON:
     "miss_type": "short-left" / "short-right" / "long-left" / "long-right" / null,
     "form_rating": 1-10,
     "feedback": "1-2 sentence coaching feedback — specific and actionable",
-    "key_issue": "Main issue or 'none'",
+    "key_issue": one of: "elbow not fully extended", "elbow flare", "elbow too low", "elbow dropping", "no wrist snap", "flat release", "release too low", "release too late", "release too early", "not enough knee bend", "too much knee bend", "stance too narrow", "stance too wide", "no leg power", "off balance", "leaning forward", "leaning backward", "trunk rotation", "guide hand interference", "thumb flick", "no follow through", "short follow through", "inconsistent", "rushed", "none", or a short description if none match,
     "quick_cue": "2-4 word cue"
 }}
 """
@@ -1481,7 +1772,35 @@ Provide BRIEF analysis in JSON:
             else:
                 strat_j = None
 
+            # --- Strategy K: Raw-traj-first + classifier-confirm ---
+            # Adds rim-area classifier as 3rd signal alongside trajectory + Gemini.
+            # Classifier is especially valuable during occlusion when trajectory is incomplete.
+            cl_made = classifier_result.get("made") if classifier_result else None
+            cl_conf = classifier_result.get("confidence", 0) if classifier_result else 0
+            cl_meaningful = cl_made is not None and cl_conf >= 0.55
+
+            if not rim_position_available:
+                strat_k = None
+            elif tr_meaningful and cl_meaningful and tr_made == cl_made:
+                # Traj + classifier agree → highest confidence
+                strat_k = tr_made
+            elif tr_meaningful and tr_conf >= 0.65:
+                # High-conf trajectory → trust it even without classifier
+                strat_k = tr_made
+            elif cl_meaningful and cl_conf >= 0.70:
+                # High-conf classifier → can override weak/missing trajectory
+                strat_k = cl_made
+            elif tr_meaningful and gemini_made is not None and tr_made == gemini_made:
+                # Traj + Gemini agree → use their answer
+                strat_k = tr_made
+            elif gemini_made is not None:
+                # Fallback to Gemini
+                strat_k = gemini_made
+            else:
+                strat_k = None
+
             # *** ACTIVE STRATEGY: H (raw-trajectory-first) ***
+            # Strategy K is logged for comparison but H remains active until validated.
             active_strategy = "H"
             final_made = strat_h
             result["made"] = final_made
@@ -1504,10 +1823,14 @@ Provide BRIEF analysis in JSON:
             if traj_result_clean:
                 tc_str = "MADE" if traj_result_clean["made"] else ("MISSED" if traj_result_clean["made"] is False else "UNCLEAR")
                 tc_summary = f"{tc_str} {traj_result_clean['confidence']:.0%}"
+            cl_summary = "none"
+            if classifier_result:
+                cl_str = "MADE" if cl_made is True else ("MISSED" if cl_made is False else "UNCLEAR")
+                cl_summary = f"{cl_str} {cl_conf:.0%}"
 
             print(f"   ┌──────────────────────────────────────────────────────────────")
             print(f"   │ 📊 Shot #{shot_idx} — Strategy Comparison")
-            print(f"   │ Inputs: gemini={_fmt(gemini_made)}, raw_traj={tr_summary}, clean_traj={tc_summary}")
+            print(f"   │ Inputs: gemini={_fmt(gemini_made)}, raw_traj={tr_summary}, clean_traj={tc_summary}, classifier={cl_summary}")
             print(f"   │")
             print(f"   │ CLEANED TRAJ:                    RAW TRAJ:")
             print(f"   │ A) Gemini-only:     {_fmt(strat_a):<6}       F) Raw-traj-only:    {_fmt(strat_f)}")
@@ -1515,11 +1838,61 @@ Provide BRIEF analysis in JSON:
             print(f"   │ C) Gem1st+clean:    {_fmt(strat_c):<6}       H) Raw-traj-first:   {_fmt(strat_h)} {'←ACT' if active_strategy=='H' else ''}")
             print(f"   │ D) Clean-traj-1st:  {_fmt(strat_d):<6}       I) Agree(raw):       {_fmt(strat_i)}")
             print(f"   │ E) Agree(clean):    {_fmt(strat_e):<6}       J) Gem+raw-confirm:  {_fmt(strat_j)}")
+            print(f"   │                                  K) Traj+cls:         {_fmt(strat_k)}")
             print(f"   │")
             print(f"   │ ➡️  ACTIVE ({active_strategy}): {_fmt(final_made)}")
             print(f"   └──────────────────────────────────────────────────────────────")
 
-            _strategy_log.append((shot_idx, strat_a, strat_b, strat_c, strat_d, strat_e, strat_f, strat_g, strat_h, strat_i, strat_j))
+            _strategy_log.append((shot_idx, strat_a, strat_b, strat_c, strat_d, strat_e, strat_f, strat_g, strat_h, strat_i, strat_j, strat_k))
+
+            # --- Save rim crops to Supabase for future classifier training ---
+            if (_supabase_client and rim_position_available and outcome_frames
+                    and final_made is not None):
+                try:
+                    label_dir = "ball_through_hoop" if final_made else "ball_not_through_hoop"
+                    rim_crop_cx = int(rim_x * width)
+                    rim_crop_cy = int(rim_y * height)
+                    crop_radius = detected_rim_radius_px * 2 if detected_rim_radius_px else int(width * 0.04)
+                    sid = session_id or "nosession"
+                    saved_count = 0
+
+                    for outcome_img, outcome_frame_num in outcome_frames:
+                        oh, ow = outcome_img.shape[:2]
+                        scale_x = ow / width
+                        scale_y = oh / height
+                        cx = int(rim_crop_cx * scale_x)
+                        cy = int(rim_crop_cy * scale_y)
+                        cr = int(crop_radius * scale_x)
+
+                        x1 = max(0, cx - cr)
+                        y1 = max(0, cy - cr)
+                        x2 = min(ow, cx + cr)
+                        y2 = min(oh, cy + cr)
+
+                        if x2 - x1 > 10 and y2 - y1 > 10:
+                            # 128x128 crop (what the classifier will see)
+                            crop = cv2.resize(outcome_img[y1:y2, x1:x2], (128, 128))
+                            _, crop_buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                            crop_filename = f"{label_dir}/{sid}_shot{shot_idx}_frame{outcome_frame_num}.jpg"
+
+                            # Full outcome frame (for manual review)
+                            _, full_buf = cv2.imencode('.jpg', outcome_img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                            full_filename = f"{label_dir}/{sid}_shot{shot_idx}_frame{outcome_frame_num}_full.jpg"
+
+                            _supabase_client.storage.from_("rim-training-data").upload(
+                                crop_filename, bytes(crop_buf),
+                                {"content-type": "image/jpeg", "upsert": "true"}
+                            )
+                            _supabase_client.storage.from_("rim-training-data").upload(
+                                full_filename, bytes(full_buf),
+                                {"content-type": "image/jpeg", "upsert": "true"}
+                            )
+                            saved_count += 1
+
+                    if saved_count > 0:
+                        print(f"   💾 Saved {saved_count} rim crops to Supabase ({label_dir})")
+                except Exception as save_err:
+                    print(f"   ⚠️ Rim crop save failed: {save_err}")
 
             # Create thumbnail with skeleton overlay
             # Use the release frame (index 14 in 20-frame layout) for thumbnail
@@ -1538,6 +1911,11 @@ Provide BRIEF analysis in JSON:
 
             print(f"   ✓ Shot {shot_idx}: {result.get('made', 'unknown')} - {result.get('feedback', '')[:40]}...")
 
+            # Override quick_cue from standardized map when key_issue matches
+            key_issue_raw = result.get("key_issue", "")
+            key_issue_normalized = key_issue_raw.lower().strip() if key_issue_raw else ""
+            quick_cue = QUICK_CUE_MAP.get(key_issue_normalized, result.get("quick_cue"))
+
             return ShotAnalysis(
                 shot_number=shot_event.shot_number,
                 made=result.get("made"),
@@ -1545,7 +1923,7 @@ Provide BRIEF analysis in JSON:
                 form_rating=result.get("form_rating"),
                 feedback=result.get("feedback", ""),
                 key_issue=result.get("key_issue"),
-                quick_cue=result.get("quick_cue"),
+                quick_cue=quick_cue,
                 elbow_angle_load=shot_event.elbow_angle_load,
                 elbow_angle_release=shot_event.elbow_angle_release,
                 wrist_height_release=shot_event.wrist_height_release,
@@ -1618,18 +1996,20 @@ Provide BRIEF analysis in JSON:
                 if cap_start <= frame_count <= cap_end and frame_count % 4 == 0:
                     ball_center = None
                     ball_status = "no_tracker"
+                    likely_occluded = False
                     if ball_tracker:
                         if ball_tracker.in_flight and ball_tracker.last_detection and ball_tracker.last_detection.detected:
                             ball_center = ball_tracker.last_detection.center
                             ball_status = f"tracked({ball_center[0]:.0f},{ball_center[1]:.0f})"
                         elif ball_tracker.in_flight:
                             ball_status = "in_flight_no_detection"
+                            likely_occluded = True
                         else:
                             ball_status = "flight_ended"
                     small = cv2.resize(frame, (640, int(640 * height / width)))
                     if cap_shot_idx not in outcome_frames_buffer:
                         outcome_frames_buffer[cap_shot_idx] = []
-                    outcome_frames_buffer[cap_shot_idx].append((small, ball_center, frame_count))
+                    outcome_frames_buffer[cap_shot_idx].append((small, ball_center, frame_count, likely_occluded))
                     print(f"   📸 Outcome frame for shot #{cap_shot_idx}: frame={frame_count}, ball={ball_status}")
 
             # Clean up expired outcome captures
@@ -1667,8 +2047,9 @@ Provide BRIEF analysis in JSON:
                     for pending in pending_shots:
                         p_shot, p_ts, p_lm, p_vis, p_frame, p_idx = pending
                         raw_outcomes = outcome_frames_buffer.pop(p_idx, [])
-                        ball_detected_count = sum(1 for _, bc, _ in raw_outcomes if bc is not None)
-                        print(f"   📦 Shot #{p_idx}: {len(raw_outcomes)} raw outcome frames, {ball_detected_count} with ball position")
+                        ball_detected_count = sum(1 for _, bc, *_ in raw_outcomes if bc is not None)
+                        occluded_count = sum(1 for *_, occ in raw_outcomes if occ)
+                        print(f"   📦 Shot #{p_idx}: {len(raw_outcomes)} raw outcome frames, {ball_detected_count} with ball position, {occluded_count} occluded")
                         selected_outcome = _select_outcome_frames(
                             raw_outcomes,
                             rim_x, rim_y, width, height
@@ -1782,15 +2163,15 @@ Provide BRIEF analysis in JSON:
             print(f"\n┌───────────────────────────────────────────────────────────────────────────────────────────")
             print(f"│ 🏀 SESSION STRATEGY COMPARISON ({len(_strategy_log)} shots)")
             print(f"│")
-            print(f"│  Shot#  A:Gem  B:CTrj  C:G+CT  D:CT1st  E:AgC  F:RTrj  G:G+RT  H:RT1st  I:AgR  J:G+RC")
-            print(f"│  ─────  ─────  ──────  ──────  ───────  ─────  ──────  ──────  ───────  ─────  ──────")
+            print(f"│  Shot#  A:Gem  B:CTrj  C:G+CT  D:CT1st  E:AgC  F:RTrj  G:G+RT  H:RT1st  I:AgR  J:G+RC  K:T+Cls")
+            print(f"│  ─────  ─────  ──────  ──────  ───────  ─────  ──────  ──────  ───────  ─────  ──────  ──────")
             for entry in _strategy_log:
                 si = entry[0]
                 vals = entry[1:]
                 cols = "  ".join(f"{_s(v):<5}" for v in vals)
                 print(f"│  #{si:<4}  {cols}")
             print(f"│")
-            print(f"│  TOTALS:                CLEANED TRAJ                          RAW TRAJ")
+            print(f"│  TOTALS:                CLEANED TRAJ                          RAW TRAJ + CLASSIFIER")
             print(f"│  A) Gemini-only:         {_count([s[1] for s in _strategy_log])}")
             print(f"│  B) Clean-traj-only:     {_count([s[2] for s in _strategy_log])}")
             print(f"│  C) Gem1st+clean:        {_count([s[3] for s in _strategy_log])}")
@@ -1801,6 +2182,7 @@ Provide BRIEF analysis in JSON:
             print(f"│  H) Raw-traj-first:      {_count([s[8] for s in _strategy_log])}")
             print(f"│  I) Agree(raw):          {_count([s[9] for s in _strategy_log])}")
             print(f"│  J) Gem+raw-confirm:     {_count([s[10] for s in _strategy_log])}")
+            print(f"│  K) Traj+classifier:     {_count([s[11] for s in _strategy_log])}")
             print(f"└───────────────────────────────────────────────────────────────────────────────────────────")
         print()
         

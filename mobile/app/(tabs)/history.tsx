@@ -14,9 +14,11 @@ import {
   RefreshControl,
   Alert,
   Platform,
+  Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
+import { useFocusEffect } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../contexts/AuthContext';
 import { useFingerprint } from '../../contexts/FingerprintContext';
@@ -36,9 +38,12 @@ function HistoryScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [sortBy, setSortBy] = useState<SortOption>('recent');
 
-  useEffect(() => {
-    loadSessions();
-  }, []);
+  // Refresh sessions every time the history tab is focused
+  useFocusEffect(
+    useCallback(() => {
+      loadSessions();
+    }, [])
+  );
 
   const loadSessions = async () => {
     if (!user) return;
@@ -185,7 +190,7 @@ function HistoryScreen() {
 
 export default function HistoryScreenWithBoundary() {
   return (
-    <ErrorBoundary>
+    <ErrorBoundary screenName="History">
       <HistoryScreen />
     </ErrorBoundary>
   );
@@ -194,6 +199,12 @@ export default function HistoryScreenWithBoundary() {
 // Session Card Component
 function SessionCard({ session, fingerprint }: { session: Session & { id: string }; fingerprint: ShotFingerprint | null }) {
   const router = useRouter();
+  const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    db.getSessionThumbnail(session.id).then(setThumbnailUrl);
+  }, [session.id]);
+
   const date = new Date(session.started_at);
   const formattedDate = date.toLocaleDateString('en-US', {
     month: 'short',
@@ -225,9 +236,13 @@ function SessionCard({ session, fingerprint }: { session: Session & { id: string
   return (
     <TouchableOpacity style={styles.sessionCard} activeOpacity={0.8} onPress={() => router.push(`/session/${session.id}`)}>
       <View style={styles.sessionHeader}>
-        {/* Thumbnail placeholder */}
+        {/* Thumbnail */}
         <View style={styles.thumbnailContainer}>
-          <Ionicons name="basketball-outline" size={28} color="#FF4D00" />
+          {thumbnailUrl ? (
+            <Image source={{ uri: thumbnailUrl }} style={styles.thumbnailImage} />
+          ) : (
+            <Ionicons name="basketball-outline" size={28} color="#FF4D00" />
+          )}
         </View>
 
         <View style={styles.sessionInfo}>
@@ -422,6 +437,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#2A2A2A',
     marginRight: 12,
+    overflow: 'hidden',
+  },
+  thumbnailImage: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 12,
   },
   sessionInfo: {
     flex: 1,

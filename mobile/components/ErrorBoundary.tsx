@@ -4,12 +4,36 @@ import { Ionicons } from '@expo/vector-icons';
 
 interface Props {
   children: ReactNode;
+  screenName?: string;
 }
 
 interface State {
   hasError: boolean;
   error: Error | null;
 }
+
+const SCREEN_ERROR_MESSAGES: Record<string, { title: string; subtitle: string }> = {
+  'Home': {
+    title: 'Home couldn\'t load',
+    subtitle: 'Your coaching insights and session data hit a snag. Try refreshing.',
+  },
+  'Record': {
+    title: 'Recording error',
+    subtitle: 'The camera or analysis ran into a problem. Your video is safe — try again.',
+  },
+  'History': {
+    title: 'History couldn\'t load',
+    subtitle: 'We couldn\'t fetch your past sessions. Pull down to refresh or try again.',
+  },
+  'Profile': {
+    title: 'Profile error',
+    subtitle: 'Your profile data couldn\'t be loaded. Try again in a moment.',
+  },
+  'Session Detail': {
+    title: 'Session couldn\'t load',
+    subtitle: 'We couldn\'t load this session\'s details. Go back and try opening it again.',
+  },
+};
 
 export class ErrorBoundary extends Component<Props, State> {
   state: State = { hasError: false, error: null };
@@ -35,12 +59,13 @@ export class ErrorBoundary extends Component<Props, State> {
 
   render() {
     if (this.state.hasError) {
+      const msgs = SCREEN_ERROR_MESSAGES[this.props.screenName || ''];
       return (
         <View style={styles.container}>
           <Ionicons name="warning-outline" size={48} color="#FF4D00" />
-          <Text style={styles.title}>Something went wrong</Text>
+          <Text style={styles.title}>{msgs?.title || 'Something went wrong'}</Text>
           <Text style={styles.subtitle}>
-            This screen ran into an error. You can try again or go back home.
+            {msgs?.subtitle || 'This screen ran into an error. You can try again or go back home.'}
           </Text>
 
           {this.state.error && (

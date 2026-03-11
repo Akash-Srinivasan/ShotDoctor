@@ -83,9 +83,17 @@ class RimDetector:
             'max_radius': 150,
         }
 
-        # Color detection parameters (for orange rims)
-        self.orange_hsv_lower = np.array([5, 100, 100])
-        self.orange_hsv_upper = np.array([25, 255, 255])
+        # Color detection parameters for rim (orange to red)
+        # Two ranges needed because red wraps around H=0/180 in HSV
+        # Very low S/V thresholds: gym rims can appear washed-out (S~30-40)
+        # under dim or fluorescent lighting
+        self.rim_hsv_ranges = [
+            (np.array([0, 25, 40]), np.array([30, 255, 255])),    # red → orange → yellow
+            (np.array([170, 25, 40]), np.array([180, 255, 255])), # deep red wrap-around
+        ]
+        # Legacy single range (used by _detect_color full-frame method)
+        self.orange_hsv_lower = np.array([0, 25, 40])
+        self.orange_hsv_upper = np.array([30, 255, 255])
 
         # Load YOLO if requested
         if method in ['yolo', 'combined']:
@@ -121,6 +129,233 @@ class RimDetector:
 
         # Return highest confidence detection
         return max(detections, key=lambda d: d.confidence)
+
+    def detect_near_point(self, frame: np.ndarray, center: Tuple[int, int],
+                          min_radius_frac: float = 0.03,
+                          max_radius_frac: float = 0.20) -> List[RimDetection]:
+        """
+        Detect rims near a point using orange/red color contour detection,
+        with Hough circle fallback if color finds nothing.
+
+        Crops ~20% of frame dimensions around `center`, finds orange/red contours,
+        fits ellipses, and returns detections. Works for both front-view (circular)
+        and side-view (elliptical) rims.
+
+        Args:
+            frame: BGR image (numpy array)
+            center: (x, y) pixel coordinates to search around
+            min_radius_frac: Minimum rim radius as fraction of frame width
+            max_radius_frac: Maximum rim radius as fraction of frame width
+
+        Returns:
+            List of RimDetection objects sorted by size (largest first),
+            with coordinates in full-frame space.
+        """
+        h, w = frame.shape[:2]
+        cx, cy = center
+
+        # Crop region: 30% of frame dimensions around the point
+        crop_half_w = int(w * 0.15)
+        crop_half_h = int(h * 0.15)
+        x1 = max(0, cx - crop_half_w)
+        y1 = max(0, cy - crop_half_h)
+        x2 = min(w, cx + crop_half_w)
+        y2 = min(h, cy + crop_half_h)
+        crop = frame[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            return []
+
+        # --- Primary: Color contour detection ---
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
+        # Combine multiple HSV ranges (orange + red wrap-around)
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for lower, upper in self.rim_hsv_ranges:
+            mask |= cv2.inRange(hsv, lower, upper)
+
+        # Clean up mask (small kernel to preserve thin rim contours)
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        min_dim = int(w * min_radius_frac * 2)  # minimum diameter in pixels
+        max_dim = int(w * max_radius_frac * 2)  # maximum diameter in pixels
+
+        # Scan a horizontal band around the user mark for the rim.
+        # The rim is a thin orange band at the user's Y position — find its
+        # horizontal extent to measure the diameter.
+        crop_h, crop_w = crop.shape[:2]
+        crop_cy = crop_h // 2  # user mark is at crop center
+
+        # Try narrow band first (±25px). If it finds no orange, widen to ±50px.
+        # The wider band catches the top/bottom arcs of the rim ring when the
+        # net occludes the center (common on front-view shots).
+        for band_half in (25, 50):
+            band_top = max(0, crop_cy - band_half)
+            band_bot = min(crop_h, crop_cy + band_half)
+            band_mask = mask[band_top:band_bot, :]
+            if np.count_nonzero(band_mask) >= 5:
+                break
+
+        # Log color detection diagnostics
+        total_orange = int(np.count_nonzero(mask))
+        band_orange = int(np.count_nonzero(band_mask))
+        print(f"   🎨 Color scan: {total_orange} orange px in crop, {band_orange} in band (±{band_half}px)")
+
+        # Find orange columns in the band, then measure the rim diameter.
+        #
+        # Key insight: the rim can appear as TWO separate orange runs in the
+        # horizontal band — the left and right arcs of the circle — with a gap
+        # in the middle (the rim interior / net). A single-run approach picks
+        # only one arc and gets half the diameter. Instead:
+        #   1. Split into contiguous runs (gap > 5px = separate segment)
+        #   2. Keep only runs whose center is within max_radius of crop center
+        #      (filters out distant orange objects like posts or backboard frame)
+        #   3. Span from leftmost to rightmost kept run = rim diameter
+        orange_cols = np.where(band_mask.any(axis=0))[0]
+
+        if len(orange_cols) >= 5:  # need at least a few pixels
+            # Build contiguous runs (gap > 5px = separate segment)
+            runs = []
+            run_start = int(orange_cols[0])
+            prev_col = int(orange_cols[0])
+            for col in orange_cols[1:]:
+                col = int(col)
+                if col - prev_col > 5:
+                    runs.append((run_start, prev_col))
+                    run_start = col
+                prev_col = col
+            runs.append((run_start, prev_col))
+
+            # Strategy: find the most SYMMETRIC pair of runs about the crop center.
+            #
+            # The rim's left and right arcs appear equidistant from center.
+            # Other orange objects (ball, posts, backboard frame) are off-center
+            # and would form an asymmetric pair. If no good symmetric pair is
+            # found, fall back to the single run closest to center.
+            crop_center_x = crop_w // 2
+            half_max = max_dim // 2
+
+            # Filter to runs within max_radius of crop center
+            nearby_runs = [r for r in runs
+                           if abs((r[0] + r[1]) // 2 - crop_center_x) <= half_max]
+            if not nearby_runs:
+                nearby_runs = [min(runs, key=lambda r: abs((r[0] + r[1]) // 2 - crop_center_x))]
+
+            left_runs = [r for r in nearby_runs if (r[0] + r[1]) // 2 <  crop_center_x]
+            right_runs = [r for r in nearby_runs if (r[0] + r[1]) // 2 >= crop_center_x]
+
+            left_col, right_col = None, None
+
+            if left_runs and right_runs:
+                # Try every (left, right) combination; pick most symmetric pair
+                # whose combined span is within the allowed rim diameter range.
+                best_score = float('inf')
+                for lr in left_runs:
+                    for rr in right_runs:
+                        span = rr[1] - lr[0]
+                        if not (min_dim <= span <= max_dim):
+                            continue
+                        ld = crop_center_x - (lr[0] + lr[1]) // 2
+                        rd = (rr[0] + rr[1]) // 2 - crop_center_x
+                        score = abs(ld - rd)  # 0 = perfectly symmetric
+                        if score < best_score:
+                            best_score = score
+                            left_col, right_col = lr[0], rr[1]
+
+            if left_col is None:
+                # No valid symmetric pair — use single run closest to center
+                valid = [r for r in nearby_runs if min_dim <= r[1] - r[0] <= max_dim]
+                best_run = min(valid or nearby_runs,
+                               key=lambda r: abs((r[0] + r[1]) // 2 - crop_center_x))
+                left_col, right_col = best_run
+
+            rim_width = right_col - left_col
+            print(f"   🎨 Runs: {len(runs)} total, {len(nearby_runs)} nearby, "
+                  f"span {left_col}-{right_col} (width={rim_width}px)")
+
+            if min_dim <= rim_width <= max_dim:
+                # Rim center in crop coords
+                rcx = (left_col + right_col) // 2
+                rcy = crop_cy
+
+                # Full-frame coords
+                fx = left_col + x1
+                fy = band_top + y1
+                fcx = rcx + x1
+                fcy = rcy + y1
+                fh = band_bot - band_top
+
+                # Orange density in the band region
+                band_region = mask[band_top:band_bot, left_col:right_col+1]
+                orange_density = np.count_nonzero(band_region) / max(band_region.size, 1)
+
+                return [RimDetection(
+                    x=fx,
+                    y=fy,
+                    width=rim_width,
+                    height=fh,
+                    confidence=orange_density,
+                    method='color_contour',
+                    center=(fcx, fcy)
+                )]
+
+        # --- Fallback: Hough circles on the crop ---
+        # Color detection failed (non-orange rim, bad lighting, etc.)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+
+        min_r = max(8, int(w * min_radius_frac))
+        max_r = int(w * max_radius_frac)
+
+        # Tuned params for small crops: lower param2 for sensitivity,
+        # lower minDist since crop is small
+        circles = cv2.HoughCircles(
+            blurred,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=max(min_r, 30),
+            param1=50,
+            param2=25,  # slightly more sensitive than full-frame (30)
+            minRadius=min_r,
+            maxRadius=max_r,
+        )
+
+        if circles is None:
+            return []
+
+        circles = np.around(circles[0]).astype(int)
+        # Pick the circle closest to the center of the crop AND closest to
+        # expected rim size. Without size weighting, large circles (backboard,
+        # net area) beat correctly-sized rim circles just because their center
+        # is slightly nearer to the user mark.
+        crop_cx = cx - x1
+        crop_cy = cy - y1
+        expected_r = max(min_r, int(w * 0.025))  # ~2.5% of frame width as baseline
+        circles_sorted = sorted(circles, key=lambda c: (
+            (int(c[0]) - crop_cx) ** 2 + (int(c[1]) - crop_cy) ** 2
+            + (int(c[2]) - expected_r) ** 2 * 4  # penalize circles far from expected rim size
+        ))
+
+        detections = []
+        for circle in circles_sorted[:3]:  # consider top 3 closest
+            lx, ly, r = int(circle[0]), int(circle[1]), int(circle[2])
+            fx, fy = lx + x1, ly + y1
+
+            detections.append(RimDetection(
+                x=max(0, fx - r),
+                y=max(0, fy - r),
+                width=2 * r,
+                height=2 * r,
+                confidence=0.5,  # lower confidence since no color confirmation
+                method='hough_fallback',
+                center=(fx, fy)
+            ))
+
+        return detections
 
     def detect_all(self, frame: np.ndarray) -> List[RimDetection]:
         """
@@ -166,18 +401,18 @@ class RimDetector:
         )
 
         if circles is not None:
-            circles = np.uint16(np.around(circles))
-            for circle in circles[0]:
-                x, y, r = circle
-                # Convert to bounding box
+            circles = np.around(circles[0]).astype(int)
+            for circle in circles:
+                x, y, r = int(circle[0]), int(circle[1]), int(circle[2])
+                # Convert to bounding box (clamp to avoid negatives)
                 detections.append(RimDetection(
-                    x=int(x - r),
-                    y=int(y - r),
-                    width=int(2 * r),
-                    height=int(2 * r),
+                    x=max(0, x - r),
+                    y=max(0, y - r),
+                    width=2 * r,
+                    height=2 * r,
                     confidence=0.7,  # Hough doesn't give confidence, use default
                     method='hough',
-                    center=(int(x), int(y))
+                    center=(x, y)
                 ))
 
         return detections

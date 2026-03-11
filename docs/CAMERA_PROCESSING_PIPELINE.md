@@ -33,7 +33,8 @@ ShotAnalysis (JSON)       -->  sent to mobile app
 | `api/core/biomechanics.py` | OptimalRange constants, research-backed reference values |
 | `api/main.py` | FastAPI endpoint, Gemini prompts, ShotAnalysis model, **server-side Supabase persistence** |
 | `api/core/ball_tracker.py` | YOLO ball detection, CustomBallTracker, trajectory tracking |
-| `api/core/rim_detector.py` | Rim position detection utilities |
+| `api/core/rim_detector.py` | Rim position/size detection (Hough circles + YOLO + color), **active in production** |
+| `api/core/rim_area_classifier.py` | Binary classifier for rim-area outcome frame crops (make/miss signal) |
 | `mobile/lib/api.ts` | TypeScript ShotAnalysis interface, API client |
 | `mobile/lib/supabase.ts` | Shot/Session DB types, createShots/createSession (fallback) |
 | `mobile/app/(tabs)/record.tsx` | Video recording, upload, results display |
@@ -149,6 +150,22 @@ When the clean segment doesn't reach the rim (closest point > 4x rim radius away
 
 Falls back to old consecutive-frame method (checking for above→below crossing within 2x rim-radius horizontal window). Key improvement: works even with gaps in tracking data near the rim.
 
+### 4b. Rim Detection & Sizing
+
+**Location**: `api/main.py` (`_run_analysis()`), `api/core/rim_detector.py`
+
+At the start of video processing (before the main frame loop), the `RimDetector` is activated to auto-calibrate rim dimensions:
+
+1. Sample 5-8 frames from the first 2 seconds of video
+2. Run Hough circle detection on each frame
+3. If user provided `rim_x`/`rim_y`, filter detections to the one **closest** to the user-marked position (handles multi-rim courts)
+4. Take the **median** width and center across successful detections
+5. Require >= 3 agreeing frames for confidence
+
+**Output**: `detected_rim_radius_px` (pixel-accurate rim radius) replaces the old hardcoded `frame_width * 0.02` guess. If detection fails, the 2% heuristic is used as fallback.
+
+**Multi-rim handling**: When the user has calibrated a rim position, `detect_all()` returns ALL detected circles, but only the one nearest to the user's marked point (within 20% of frame diagonal) is used. This prevents confusion from background hoops.
+
 ### 5. Classification Thresholds
 
 | Check | Threshold | Result |
@@ -158,7 +175,7 @@ Falls back to old consecutive-frame method (checking for above→below crossing 
 | Near miss | `min_dist < rim_radius * 4.0` | `made=False` with directional miss_type |
 | Far from rim | Beyond near_threshold | `made=None` |
 
-Key params: `rim_radius = frame_width * 0.02`, `make_threshold = rim_radius * 1.5`, `near_threshold = rim_radius * 4.0`
+Key params: `rim_radius` = auto-detected via RimDetector (Hough circles from early video frames), with `frame_width * 0.02` fallback. `make_threshold = rim_radius * 1.5`, `near_threshold = rim_radius * 4.0`
 
 ### 6. Camera Angle Confidence
 
@@ -175,8 +192,9 @@ Same three prompt branches (A: trajectory guidance, B: rim only, C: no rim). **N
 
 ### 8. Tiered Decision Hierarchy
 
-Replaces the old "post-processing override" approach with six explicit tiers:
+**Active strategy: H** (raw-trajectory-first). Strategy K (with rim-area classifier) is logged for comparison but not yet active.
 
+**Strategy H (active):**
 ```
 Tier 1: No rim position → null (can't judge)
 Tier 2: Trajectory + Gemini AGREE → use their answer (highest confidence)
@@ -186,9 +204,35 @@ Tier 5: Gemini has opinion + trajectory missing/weak → trust Gemini
 Tier 6: Both unclear → null
 ```
 
-**Key change**: Removed "miss-by-default" rule. Previously, Gemini's `made=true` was overridden to `null` when trajectory was missing. Now Gemini is trusted in Tier 5 because rim-cropped outcome frames make it more reliable.
+**Strategy K (logged, pending validation):**
+```
+Tier 1: No rim position → null
+Tier 2: Trajectory + classifier AGREE → use their answer (highest confidence)
+Tier 3: High-confidence trajectory (≥65%) → trust trajectory
+Tier 4: High-confidence classifier (≥70%) → can override weak trajectory
+Tier 5: Trajectory + Gemini agree → use their answer
+Tier 6: Gemini has opinion → trust Gemini
+Tier 7: Both unclear → null
+```
 
-### 9. Diagnostic Logging
+Strategy K adds the rim-area classifier as a 3rd signal. The classifier is especially valuable during **occlusion** (ball hidden behind rim/net) when trajectory data is incomplete but the classifier can still see net movement.
+
+### 9. Rim-Area Classifier
+
+**Location**: `api/core/rim_area_classifier.py`, integrated via `_shared_rim_classifier` in `api/main.py`
+
+A YOLOv8n-cls binary classifier trained on Roboflow `basketball-lhqoe` dataset crops:
+
+- **Input**: 128x128 crops centered on the detected rim bounding box, from outcome frames
+- **Classes**: `ball_through_hoop` vs `ball_not_through_hoop`
+- **Multi-frame voting**: Runs on all outcome frame crops for a shot
+  - >= 2 frames show "through" with conf > 0.6 → `made=True`
+  - 0 frames show "through" → `made=False`
+  - Otherwise → `made=None` (unclear)
+- **Performance**: ~10-20MB loaded, ~5ms per crop, ~30ms total per shot (batch of ~14 crops)
+- **Occlusion-aware**: When trajectory has gaps from occlusion, classifier gets more weight in Strategy K since it can detect net movement even when ball tracking fails
+
+### 10. Diagnostic Logging
 
 Every shot logs the decision chain:
 - `🧹 Trajectory cleaned: X → Y points (N segments found)`

@@ -512,6 +512,37 @@ export const db = {
       return null;
     }
   },
+
+  /**
+   * Update a shot's thumbnail URL after uploading
+   */
+  async updateShotThumbnail(
+    sessionId: string,
+    shotNumber: number,
+    thumbnailUrl: string
+  ): Promise<void> {
+    const { error } = await supabase
+      .from('shots')
+      .update({ thumbnail_url: thumbnailUrl })
+      .eq('session_id', sessionId)
+      .eq('shot_number', shotNumber);
+    if (error) console.error('Error updating thumbnail URL:', error);
+  },
+
+  /**
+   * Get first shot's thumbnail for a session
+   */
+  async getSessionThumbnail(sessionId: string): Promise<string | null> {
+    const { data } = await supabase
+      .from('shots')
+      .select('thumbnail_url')
+      .eq('session_id', sessionId)
+      .not('thumbnail_url', 'is', null)
+      .order('shot_number', { ascending: true })
+      .limit(1)
+      .single();
+    return data?.thumbnail_url || null;
+  },
 };
 
 // ============================================================================

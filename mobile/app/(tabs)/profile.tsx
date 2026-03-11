@@ -273,7 +273,7 @@ function ProfileScreen() {
 
 export default function ProfileScreenWithBoundary() {
   return (
-    <ErrorBoundary>
+    <ErrorBoundary screenName="Profile">
       <ProfileScreen />
     </ErrorBoundary>
   );

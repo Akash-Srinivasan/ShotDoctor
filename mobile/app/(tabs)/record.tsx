@@ -340,11 +340,15 @@ function RecordScreen() {
         try {
           if (analysis.server_persisted) {
             // Server already wrote session + shots — just upload thumbnails
+            // and write the URL back to the shots table
             console.log('✓ Server persisted results — skipping client DB writes');
             for (const shot of analysis.shots) {
               if (shot.thumbnail) {
                 try {
-                  await db.uploadThumbnail(newSessionId!, shot.shot_number, shot.thumbnail);
+                  const thumbUrl = await db.uploadThumbnail(newSessionId!, shot.shot_number, shot.thumbnail);
+                  if (thumbUrl) {
+                    await db.updateShotThumbnail(newSessionId!, shot.shot_number, thumbUrl);
+                  }
                 } catch (thumbErr) {
                   console.warn(`Thumbnail upload failed for shot ${shot.shot_number}:`, thumbErr);
                 }
@@ -521,7 +525,10 @@ function RecordScreen() {
   if (analyzing) {
     return (
       <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
-        <View style={styles.container}>
+        <ScrollView
+          contentContainerStyle={styles.analyzingScrollContent}
+          showsVerticalScrollIndicator={false}
+        >
           {currentVideoUri && (
             <View style={styles.videoPreviewContainer}>
               <VideoView
@@ -533,34 +540,34 @@ function RecordScreen() {
             </View>
           )}
 
-        <ActivityIndicator size="large" color="#ff6b00" style={styles.loader} />
-        
-        <Text style={styles.analyzingText}>{analysisProgress.message}</Text>
-        
-        {/* Progress bar */}
-        <View style={styles.progressBarContainer}>
-          <View 
-            style={[
-              styles.progressBar, 
-              { width: `${analysisProgress.progress}%` }
-            ]} 
-          />
-        </View>
-        
-        <Text style={styles.analyzingSubtext}>
-          {analysisProgress.frame && analysisProgress.totalFrames
-            ? `Frame ${analysisProgress.frame} / ${analysisProgress.totalFrames}`
-            : 'This may take 30-90 seconds'}
-          {analysisProgress.shotsFound ? ` — ${analysisProgress.shotsFound} shot${analysisProgress.shotsFound !== 1 ? 's' : ''} found` : ''}
-        </Text>
-        
-        <Text style={styles.analyzingNote}>
-          • Scanning entire video{'\n'}
-          • Detecting all shots{'\n'}
-          • Measuring form metrics{'\n'}
-          • Getting AI coaching
-        </Text>
-        </View>
+          <ActivityIndicator size="large" color="#ff6b00" style={styles.loader} />
+
+          <Text style={styles.analyzingText}>{analysisProgress.message}</Text>
+
+          {/* Progress bar */}
+          <View style={styles.progressBarContainer}>
+            <View
+              style={[
+                styles.progressBar,
+                { width: `${analysisProgress.progress}%` }
+              ]}
+            />
+          </View>
+
+          <Text style={styles.analyzingSubtext}>
+            {analysisProgress.frame && analysisProgress.totalFrames
+              ? `Frame ${analysisProgress.frame} / ${analysisProgress.totalFrames}`
+              : 'This may take 30-90 seconds'}
+            {analysisProgress.shotsFound ? ` — ${analysisProgress.shotsFound} shot${analysisProgress.shotsFound !== 1 ? 's' : ''} found` : ''}
+          </Text>
+
+          <Text style={styles.analyzingNote}>
+            • Scanning entire video{'\n'}
+            • Detecting all shots{'\n'}
+            • Measuring form metrics{'\n'}
+            • Getting AI coaching
+          </Text>
+        </ScrollView>
       </SafeAreaView>
     );
   }
@@ -961,7 +968,7 @@ function RecordScreen() {
 
 export default function RecordScreenWithBoundary() {
   return (
-    <ErrorBoundary>
+    <ErrorBoundary screenName="Record">
       <RecordScreen />
     </ErrorBoundary>
   );
@@ -1190,6 +1197,12 @@ const styles = StyleSheet.create({
   uploadOptionText: {
     fontSize: 14,
     color: '#666',
+  },
+  analyzingScrollContent: {
+    flexGrow: 1,
+    alignItems: 'center',
+    paddingTop: 20,
+    paddingBottom: 40,
   },
   videoPreviewContainer: {
     width: '90%',

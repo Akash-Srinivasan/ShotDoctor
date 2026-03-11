@@ -3,7 +3,7 @@
  * Shows fingerprint-driven insights, trends, and coaching cues.
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import {
   View,
   Text,
@@ -14,6 +14,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
+import { useFocusEffect } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../contexts/AuthContext';
 import { useFingerprint } from '../../contexts/FingerprintContext';
@@ -25,15 +26,19 @@ import { db, type Session } from '../../lib/supabase';
 function HomeScreen() {
   const router = useRouter();
   const { user, profile } = useAuth();
-  const { fingerprint, loading: fpLoading, isReady, sessionsUntilReady } = useFingerprint();
+  const { fingerprint, loading: fpLoading, isReady, sessionsUntilReady, refreshFingerprint } = useFingerprint();
   const [apiConnected, setApiConnected] = useState<boolean | null>(null);
   const [checkingApi, setCheckingApi] = useState(true);
   const [lastSession, setLastSession] = useState<Session | null>(null);
 
-  useEffect(() => {
-    checkApiConnection();
-    loadLastSession();
-  }, []);
+  // Refresh data every time the home tab is focused
+  useFocusEffect(
+    useCallback(() => {
+      checkApiConnection();
+      loadLastSession();
+      refreshFingerprint();
+    }, [user?.id])
+  );
 
   const checkApiConnection = async () => {
     setCheckingApi(true);
@@ -256,7 +261,7 @@ function HomeScreen() {
 
 export default function HomeScreenWithBoundary() {
   return (
-    <ErrorBoundary>
+    <ErrorBoundary screenName="Home">
       <HomeScreen />
     </ErrorBoundary>
   );

@@ -221,7 +221,7 @@ function SessionDetailScreen() {
 
 export default function SessionDetailWithBoundary() {
   return (
-    <ErrorBoundary>
+    <ErrorBoundary screenName="Session Detail">
       <SessionDetailScreen />
     </ErrorBoundary>
   );

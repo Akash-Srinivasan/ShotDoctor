@@ -348,6 +348,8 @@ const styles = StyleSheet.create({
   },
   buttonContainer: {
     width: '100%',
+    flexDirection: 'row',
+    gap: 12,
   },
   optionsContainer: {
     width: '100%',
